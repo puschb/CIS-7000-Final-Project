@@ -1,0 +1,13 @@
+# Copy this file to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project_id      = "cis-7000-aurora"
+gcs_bucket_name = "cis7000-aurora-data"  # Must be globally unique — change if taken
+
+# GPU VM settings (defaults are fine for most cases)
+# machine_type     = "a2-ultragpu-1g"  # 1x A100 80GB
+# boot_disk_size_gb = 256
+# preemptible       = true
+
+# Set to false to only create GCS bucket (useful before GPU quota is approved)
+# create_vm = false

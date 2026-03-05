@@ -205,3 +205,21 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+*.tfstate
+*.tfstate.*
+
+# Data and model checkpoints
+data/
+checkpoints/
+*.ckpt
+*.pickle
+
+# HuggingFace cache
+.cache/huggingface/
