@@ -1,0 +1,55 @@
+# CPU-only interactive pod for development.
+# Clones repo at startup, drops you into a shell with everything ready.
+#
+# Usage:
+#   bash scripts/k8s-interactive-cpu.sh
+#   # or manually:
+#   kubectl create -f k8s/aurora-interactive-cpu-pod.yaml
+#   kubectl exec -it aurora-dev-cpu -- /bin/bash
+#   kubectl delete pod aurora-dev-cpu
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aurora-dev-cpu
+spec:
+  initContainers:
+  - name: clone-repo
+    image: alpine/git
+    env:
+    - name: GIT_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: user
+    - name: GIT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: password
+    args:
+    - clone
+    - --single-branch
+    - --depth=1
+    - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+    - /opt/repo
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+  containers:
+  - name: aurora-dev-cpu
+    image: puschb/aurora-dev:latest
+    command: ["sh", "-c", "cd /opt/repo && echo 'Ready — repo cloned, aurora installed.' && sleep infinity"]
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+    resources:
+      requests:
+        memory: 16Gi
+        cpu: "4"
+      limits:
+        memory: 16Gi
+        cpu: "4"
+  volumes:
+  - name: repo
+    emptyDir: {}
+  restartPolicy: Never

@@ -1,0 +1,60 @@
+# CPU-only test: runs AuroraSmallPretrained on CPU. No GPU needed.
+#
+# Usage:
+#   kubectl create -f k8s/aurora-test-cpu-job.yaml
+#   kubectl logs -f aurora-test-cpu-<hash>
+#   kubectl delete job aurora-test-cpu
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aurora-test-cpu
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      initContainers:
+      - name: clone-repo
+        image: alpine/git
+        env:
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: user
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: password
+        args:
+        - clone
+        - --single-branch
+        - --depth=1
+        - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+        - /opt/repo
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+      containers:
+      - name: aurora-test-cpu
+        image: puschb/aurora-dev:latest
+        command:
+        - sh
+        - -c
+        - |
+          cd /opt/repo
+          python scripts/test_aurora_cpu.py
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+        resources:
+          requests:
+            memory: 16Gi
+            cpu: "4"
+          limits:
+            memory: 16Gi
+            cpu: "4"
+      volumes:
+      - name: repo
+        emptyDir: {}
+      restartPolicy: Never

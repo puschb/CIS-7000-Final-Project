@@ -1,0 +1,68 @@
+# Fine-tuning job: clones repo, runs src/finetune.py on A100 80GB.
+#
+# Usage:
+#   kubectl create -f k8s/aurora-finetune-job.yaml
+#   kubectl logs -f <pod-name>
+#   kubectl delete job aurora-finetune
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aurora-finetune
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+      initContainers:
+      - name: clone-repo
+        image: alpine/git
+        env:
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: user
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: password
+        args:
+        - clone
+        - --single-branch
+        - --depth=1
+        - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+        - /opt/repo
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+      containers:
+      - name: aurora-finetune
+        image: puschb/aurora-dev:latest
+        env:
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "backend:cudaMallocAsync"
+        command:
+        - sh
+        - -c
+        - |
+          cd /opt/repo
+          nvidia-smi
+          python -m src.finetune --steps 5
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+        resources:
+          requests:
+            memory: 32Gi
+            cpu: "4"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: 32Gi
+            cpu: "4"
+            nvidia.com/gpu: "1"
+      volumes:
+      - name: repo
+        emptyDir: {}
+      restartPolicy: Never
