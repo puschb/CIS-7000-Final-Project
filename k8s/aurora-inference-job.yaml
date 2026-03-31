@@ -1,0 +1,65 @@
+# Inference job: clones repo, runs src/inference.py on A100 80GB.
+#
+# Usage:
+#   kubectl create -f k8s/aurora-inference-job.yaml
+#   kubectl logs -f <pod-name>
+#   kubectl delete job aurora-inference
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aurora-inference
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+      initContainers:
+      - name: clone-repo
+        image: alpine/git
+        env:
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: user
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: password
+        args:
+        - clone
+        - --single-branch
+        - --depth=1
+        - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+        - /opt/repo
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+      containers:
+      - name: aurora-inference
+        image: puschb/aurora-dev:latest
+        command:
+        - sh
+        - -c
+        - |
+          cd /opt/repo
+          nvidia-smi
+          python -m src.inference --small
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+        resources:
+          requests:
+            memory: 32Gi
+            cpu: "4"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: 32Gi
+            cpu: "4"
+            nvidia.com/gpu: "1"
+      volumes:
+      - name: repo
+        emptyDir: {}
+      restartPolicy: Never
