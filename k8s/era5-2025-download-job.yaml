@@ -22,12 +22,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: github-secret
-                  key: username
+                  key: user
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: github-secret
-                  key: token
+                  key: password
           volumeMounts:
             - name: repo
               mountPath: /opt/repo
