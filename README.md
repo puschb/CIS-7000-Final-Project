@@ -132,7 +132,30 @@ bash scripts/k8s-setup-github-secret.sh
 
 It will prompt for your GitHub username and token.
 
-### Step 7: Build and push the Docker image
+### Step 7: Set up CDS API key (for ERA5 data)
+
+To download ERA5 weather data, you need a Climate Data Store account:
+
+1. Register at the [Climate Data Store](https://cds.climate.copernicus.eu/)
+2. Accept the [ERA5 terms of use](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels)
+3. Copy your API key from your [CDS account page](https://cds.climate.copernicus.eu/profile) and save it locally:
+
+```bash
+cat > ~/.cdsapirc << 'EOF'
+url: https://cds.climate.copernicus.eu/api
+key: <your API key>
+EOF
+```
+
+For Nautilus, the CDS key is stored as a Kubernetes secret so all pods have access automatically:
+
+```bash
+kubectl create secret generic cds-api-key \
+    --from-literal=url="https://cds.climate.copernicus.eu/api" \
+    --from-literal=key="<your API key>"
+```
+
+### Step 8: Build and push the Docker image
 
 This builds an image with all dependencies pre-installed (from `pyproject.toml`) and pushes it to Docker Hub. Only one person needs to do this initially, or when dependencies change.
 
@@ -143,7 +166,7 @@ bash scripts/docker-build-push.sh
 
 The image is pushed to `puschb/aurora-dev:latest` on Docker Hub (public).
 
-### Step 8: Set up local development environment
+### Step 9: Set up local development environment
 
 ```bash
 uv sync

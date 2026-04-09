@@ -12,8 +12,15 @@ spec:
   backoffLimit: 2
   template:
     spec:
-      nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
       initContainers:
       - name: clone-repo
         image: alpine/git
@@ -43,10 +50,21 @@ spec:
         env:
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: "backend:cudaMallocAsync"
+        - name: CDS_URL
+          valueFrom:
+            secretKeyRef:
+              name: cds-api-key
+              key: url
+        - name: CDS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: cds-api-key
+              key: key
         command:
         - sh
         - -c
         - |
+          echo "url: $CDS_URL\nkey: $CDS_KEY" > ~/.cdsapirc
           cd /opt/repo
           nvidia-smi
           python -m src.finetune --steps 5
@@ -57,11 +75,11 @@ spec:
           requests:
             memory: 32Gi
             cpu: "4"
-            nvidia.com/gpu: "1"
+            nvidia.com/a100: "1"
           limits:
             memory: 32Gi
             cpu: "4"
-            nvidia.com/gpu: "1"
+            nvidia.com/a100: "1"
       volumes:
       - name: repo
         emptyDir: {}
