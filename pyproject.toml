@@ -8,6 +8,12 @@ dependencies = [
     "microsoft-aurora",
     "torch",
     "numpy",
+    "xarray",
+    "netcdf4",
+    "cdsapi>=0.7.7",
+    "matplotlib",
+    "psutil",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]

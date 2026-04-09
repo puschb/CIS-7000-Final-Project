@@ -38,10 +38,22 @@ spec:
       containers:
       - name: aurora-test-cpu
         image: puschb/aurora-dev:latest
+        env:
+        - name: CDS_URL
+          valueFrom:
+            secretKeyRef:
+              name: cds-api-key
+              key: url
+        - name: CDS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: cds-api-key
+              key: key
         command:
         - sh
         - -c
         - |
+          echo "url: $CDS_URL\nkey: $CDS_KEY" > ~/.cdsapirc
           cd /opt/repo
           python scripts/test_aurora_cpu.py
         volumeMounts:
