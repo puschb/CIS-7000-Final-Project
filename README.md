@@ -13,7 +13,10 @@ k8s/                           # Kubernetes manifests for Nautilus
   aurora-finetune-job.yaml     #   Batch: fine-tuning (A100 80GB)
   aurora-interactive-cpu-pod.yaml  # Interactive: CPU dev pod
   aurora-interactive-pod.yaml      # Interactive: GPU dev pod (A100 80GB)
-scripts/                       # Shell scripts
+  aurora-data-pvc.yaml         #   Persistent volume claim (20Gi, rook-ceph-block)
+  aurora-data-shell.yaml       #   Lightweight pod for inspecting the PVC
+  aurora-download-job.yaml     #   Batch: download 10 days of ERA5 data to PVC
+scripts/                       # Shell & Python scripts
   docker-build-push.sh         #   Build & push Docker image to Docker Hub
   k8s-setup-github-secret.sh   #   One-time: store GitHub credentials on Nautilus
   k8s-test-cpu.sh              #   Run CPU test job
@@ -22,12 +25,18 @@ scripts/                       # Shell scripts
   k8s-finetune.sh              #   Run fine-tuning job
   k8s-interactive-cpu.sh       #   Start CPU interactive session
   k8s-interactive-gpu.sh       #   Start GPU interactive session
-  test_aurora_cpu.py            #   Standalone CPU test script
+  test_aurora_cpu.py           #   Standalone CPU test script
+  test_aurora_gpu.py           #   GPU test script (memory usage, model loading)
+  download_era5.py             #   Download ERA5 data for a date range (CLI)
+  extract_embeddings_tsne.py   #   Extract Aurora embeddings and visualize with t-SNE
 src/                           # Python source code
   data.py                      #   Batch construction utilities
   inference.py                 #   Inference CLI
   finetune.py                  #   Fine-tuning CLI
 notebooks/                     # Jupyter notebooks
+  era5_predictions.ipynb       #   ERA5 single-day prediction with AuroraSmallPretrained
+  era5_download_crop.ipynb     #   Download, crop, and save ERA5 data (configurable region/date)
+  embedding_comparison.ipynb   #   Compare global vs. cropped Aurora embeddings (t-SNE, cosine sim)
 pyproject.toml                 # Dependencies (used by both uv locally and Docker)
 ```
 
@@ -174,6 +183,75 @@ uv sync
 
 This creates a `.venv` virtual environment in the project root and installs all dependencies from `pyproject.toml` into it.
 
+## Persistent Storage (Nautilus)
+
+ERA5 data and model outputs are stored on a Persistent Volume Claim (PVC) so they survive pod restarts and deletions.
+
+### Create the PVC (one-time)
+
+```bash
+kubectl apply -f k8s/aurora-data-pvc.yaml
+kubectl get pvc aurora-data    # should show STATUS: Bound
+```
+
+This creates a **20 Gi** `rook-ceph-block` (RWO) volume named `aurora-data`. Any pod can mount it at `/mnt/data`.
+
+### Inspect the PVC interactively
+
+To browse or manually manage files on the PVC:
+
+```bash
+kubectl apply -f k8s/aurora-data-shell.yaml
+kubectl exec -it aurora-data-shell -- bash
+# Inside the pod:
+ls -la /mnt/data
+df -h /mnt/data
+# When done:
+exit
+kubectl delete pod aurora-data-shell
+```
+
+### Download ERA5 data to PVC
+
+Submit a job that downloads 10 consecutive days (Jan 1–10, 2023) of ERA5 data directly to the PVC:
+
+```bash
+kubectl apply -f k8s/aurora-download-job.yaml
+kubectl logs -f -l job-name=aurora-download-era5    # stream progress
+```
+
+Each day produces ~445 MB (surface + atmospheric). The job skips files that already exist, so it's safe to re-run if interrupted.
+
+To clean up after the download completes:
+
+```bash
+kubectl delete job aurora-download-era5
+```
+
+### Download ERA5 data locally
+
+The same download logic is available as a standalone CLI script:
+
+```bash
+uv run python scripts/download_era5.py --start 2023-01-01 --days 10 --out data/era5
+```
+
+### Mount the PVC in other pods/jobs
+
+Any pod can mount the PVC by adding these fields to its spec:
+
+```yaml
+volumeMounts:
+  - name: data
+    mountPath: /mnt/data
+volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: aurora-data
+```
+
+Note: `rook-ceph-block` is **ReadWriteOnce** — only one pod can mount it at a time.
+
 ## Usage
 
 ### Local development (CPU, no cluster needed)
@@ -201,6 +279,15 @@ uv run python -m src.inference --small --device cpu
 # Run a quick fine-tuning test on CPU (slow but works)
 uv run python -m src.finetune --steps 2
 ```
+
+### Scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/test_aurora_cpu.py` | Quick CPU test — loads `AuroraSmallPretrained`, runs a forward pass on random data |
+| `scripts/test_aurora_gpu.py` | GPU test — loads models, reports VRAM usage, runs forward pass on A100 |
+| `scripts/download_era5.py` | Download ERA5 data for a date range: `--start YYYY-MM-DD --days N --out DIR` |
+| `scripts/extract_embeddings_tsne.py` | Extract encoder/backbone embeddings from Aurora and visualize with t-SNE |
 
 ### Nautilus batch jobs
 
