@@ -4,7 +4,7 @@ metadata:
   name: era5-2025-download
 spec:
   backoffLimit: 5
-  activeDeadlineSeconds: 259200  # 72 hours
+  activeDeadlineSeconds: 604800  # 7 days
   template:
     spec:
       restartPolicy: OnFailure
@@ -45,9 +45,9 @@ spec:
             - sh
             - -c
             - |
-              pip install --quiet "cdsapi>=0.7.7"
+              pip install --quiet "cdsapi>=0.7.7" tqdm
               python -u /opt/repo/scripts/download_era5.py \
-                --start 2025-01-01 --days 365 --out /mnt/data/era5
+                --year 2026 --months 1 2 --out /mnt/data/era5
           env:
             - name: CDSAPI_URL
               valueFrom:
@@ -67,10 +67,10 @@ spec:
           resources:
             requests:
               cpu: "1"
-              memory: "1Gi"
+              memory: "2Gi"
             limits:
               cpu: "1"
-              memory: "1Gi"
+              memory: "2Gi"
       volumes:
         - name: repo
           emptyDir: {}
