@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dataloader-test
+spec:
+  initContainers:
+  - name: clone-repo
+    image: alpine/git
+    env:
+    - name: GIT_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: user
+    - name: GIT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: password
+    args:
+    - clone
+    - --single-branch
+    - --depth=1
+    - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+    - /opt/repo
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+  containers:
+  - name: test
+    image: puschb/aurora-dev:latest
+    command:
+    - sh
+    - -c
+    - |
+      cd /opt/repo
+      echo "=== Files on PVC ==="
+      ls -lh /mnt/data/era5/
+      echo ""
+      echo "=== Running dataloader test ==="
+      python -u -c "
+from datetime import datetime
+from src.data import ERA5Dataset
+
+print('Creating dataset from /mnt/data/era5 ...')
+ds = ERA5Dataset(data_dirs='/mnt/data/era5')
+print(f'Total triplets: {len(ds)}')
+print(f'First triplet: {ds.triplets[0]}')
+print(f'Last triplet:  {ds.triplets[-1]}')
+print()
+
+print('Loading sample 0 ...')
+inp, tgt = ds[0]
+print(f'Input surf_vars keys: {list(inp.surf_vars.keys())}')
+print(f'Input atmos_vars keys: {list(inp.atmos_vars.keys())}')
+print(f'Static vars keys: {list(inp.static_vars.keys())}')
+print(f'Input 2t shape: {inp.surf_vars[\"2t\"].shape}')
+print(f'Input atmos t shape: {inp.atmos_vars[\"t\"].shape}')
+print(f'Input metadata time: {inp.metadata.time}')
+print(f'Input metadata atmos_levels: {inp.metadata.atmos_levels}')
+print(f'Input lat shape: {inp.metadata.lat.shape}, range: [{inp.metadata.lat[-1]:.2f}, {inp.metadata.lat[0]:.2f}]')
+print(f'Input lon shape: {inp.metadata.lon.shape}, range: [{inp.metadata.lon[0]:.2f}, {inp.metadata.lon[-1]:.2f}]')
+print()
+print(f'Target 2t shape: {tgt.surf_vars[\"2t\"].shape}')
+print(f'Target metadata time: {tgt.metadata.time}')
+print()
+
+# Check for NaNs
+import torch
+nan_found = False
+for k, v in inp.surf_vars.items():
+    if torch.isnan(v).any():
+        print(f'WARNING: NaN in input surf_vars[\"{k}\"]')
+        nan_found = True
+for k, v in inp.atmos_vars.items():
+    if torch.isnan(v).any():
+        print(f'WARNING: NaN in input atmos_vars[\"{k}\"]')
+        nan_found = True
+if not nan_found:
+    print('No NaNs detected in sample 0')
+print()
+
+# Quick value sanity check
+t2m = inp.surf_vars['2t']
+print(f'2t (temperature) range: [{t2m.min():.1f}, {t2m.max():.1f}] K')
+msl = inp.surf_vars['msl']
+print(f'msl (pressure) range: [{msl.min():.0f}, {msl.max():.0f}] Pa')
+
+if 'swvl1' in inp.surf_vars:
+    swvl = inp.surf_vars['swvl1']
+    print(f'swvl1 (soil moisture) range: [{swvl.min():.4f}, {swvl.max():.4f}] m3/m3')
+
+print()
+print('Loading a random sample from the middle ...')
+mid = len(ds) // 2
+inp2, tgt2 = ds[mid]
+print(f'Sample {mid} input time: {inp2.metadata.time}, target time: {tgt2.metadata.time}')
+print(f'2t shape: {inp2.surf_vars[\"2t\"].shape}')
+
+print()
+print('=== Dataloader test PASSED ===')
+"
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+    - name: data
+      mountPath: /mnt/data
+    resources:
+      requests:
+        memory: 16Gi
+        cpu: "4"
+      limits:
+        memory: 16Gi
+        cpu: "4"
+  volumes:
+  - name: repo
+    emptyDir: {}
+  - name: data
+    persistentVolumeClaim:
+      claimName: era5-2025-pretrain
+  restartPolicy: Never

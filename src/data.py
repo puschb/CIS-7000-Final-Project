@@ -1,8 +1,16 @@
 """Utilities for constructing Aurora batches from various data sources."""
 
-from datetime import datetime, timedelta
+from __future__ import annotations
 
+import calendar
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
 import torch
+import xarray as xr
+from torch.utils.data import Dataset
 
 from aurora import Batch, Metadata
 
@@ -14,6 +22,318 @@ PRESSURE_LEVELS = (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 10
 FULL_RES_LAT = 721   # 0.25 degree: 90 to -90
 FULL_RES_LON = 1440  # 0.25 degree: 0 to 359.75
 
+# ERA5 NetCDF short names -> Aurora names
+SURF_ERA5_TO_AURORA = {
+    "t2m": "2t",
+    "u10": "10u",
+    "v10": "10v",
+    "msl": "msl",
+}
+
+# Extra surface vars we downloaded that aren't in the standard Aurora model.
+# These get added when extending Aurora with new variables.
+EXTRA_SURF_ERA5_TO_AURORA = {
+    "swvl1": "swvl1",
+    "stl1": "stl1",
+    "sd": "sd",
+}
+
+STATIC_ERA5_TO_AURORA = {
+    "z": "z",
+    "lsm": "lsm",
+    "slt": "slt",
+}
+
+ATMOS_ERA5_TO_AURORA = {
+    "t": "t",
+    "u": "u",
+    "v": "v",
+    "q": "q",
+    "z": "z",
+}
+
+
+# ---------------------------------------------------------------------------
+# File index helpers
+# ---------------------------------------------------------------------------
+
+def _parse_surface_files(data_dir: Path) -> dict[tuple[int, int], Path]:
+    """Map (year, month) -> surface NetCDF path."""
+    pattern = re.compile(r"(\d{4})-(\d{2})-surface\.nc$")
+    result = {}
+    for f in sorted(data_dir.glob("*-surface.nc")):
+        m = pattern.search(f.name)
+        if m:
+            result[(int(m.group(1)), int(m.group(2)))] = f
+    return result
+
+
+def _parse_atmos_files(data_dir: Path) -> list[tuple[datetime, datetime, Path]]:
+    """Return sorted list of (start_dt, end_dt, path) for atmospheric chunks."""
+    pattern = re.compile(r"(\d{4})-(\d{2})-d(\d{2})-(\d{2})-atmospheric\.nc$")
+    chunks = []
+    for f in sorted(data_dir.glob("*-atmospheric.nc")):
+        m = pattern.search(f.name)
+        if m:
+            year, month = int(m.group(1)), int(m.group(2))
+            day_start, day_end = int(m.group(3)), int(m.group(4))
+            dt_start = datetime(year, month, day_start, 0, 0)
+            dt_end = datetime(year, month, day_end, 23, 0)
+            chunks.append((dt_start, dt_end, f))
+    return chunks
+
+
+def _find_atmos_file(
+    dt: datetime, atmos_chunks: list[tuple[datetime, datetime, Path]]
+) -> tuple[Path, int] | None:
+    """Find the atmospheric chunk file containing *dt* and the time index within it."""
+    for chunk_start, chunk_end, path in atmos_chunks:
+        if chunk_start <= dt <= chunk_end:
+            hours_offset = int((dt - chunk_start).total_seconds() // 3600)
+            return path, hours_offset
+    return None
+
+
+def _surface_time_index(dt: datetime) -> int:
+    """Time index within a monthly surface file for a given datetime."""
+    return (dt.day - 1) * 24 + dt.hour
+
+
+# ---------------------------------------------------------------------------
+# ERA5Dataset
+# ---------------------------------------------------------------------------
+
+class ERA5Dataset(Dataset):
+    """PyTorch Dataset that serves Aurora-compatible (input, target) Batch pairs
+    from ERA5 NetCDF files produced by scripts/download_era5.py.
+
+    Each sample is a triplet of timestamps (t-6h, t, t+6h):
+      - input batch: history dim with t-6h and t
+      - target batch: ground truth at t+6h
+
+    Args:
+        data_dirs: One or more directories containing downloaded ERA5 data.
+            Each should have static.nc, monthly surface files, and atmospheric
+            chunk files. Typically one dir per year.
+        start_date: Inclusive start of the date range (filters triplets).
+        end_date: Exclusive end of the date range (filters triplets).
+        step_hours: Time gap between consecutive steps (default 6h for Aurora).
+        include_extra_surf: If True, include soil moisture / soil temp / snow
+            depth in surf_vars (for extending Aurora with new variables).
+    """
+
+    def __init__(
+        self,
+        data_dirs: str | Path | list[str | Path],
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        step_hours: int = 6,
+        include_extra_surf: bool = True,
+    ):
+        if isinstance(data_dirs, (str, Path)):
+            data_dirs = [data_dirs]
+        self.data_dirs = [Path(d) for d in data_dirs]
+        self.step_hours = step_hours
+        self.include_extra_surf = include_extra_surf
+
+        self.surf_map = SURF_ERA5_TO_AURORA.copy()
+        if include_extra_surf:
+            self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
+
+        # Build file indices across all data directories
+        self.surface_files: dict[tuple[int, int], Path] = {}
+        self.atmos_chunks: list[tuple[datetime, datetime, Path]] = []
+        static_path = None
+
+        for d in self.data_dirs:
+            self.surface_files.update(_parse_surface_files(d))
+            self.atmos_chunks.extend(_parse_atmos_files(d))
+            candidate = d / "static.nc"
+            if candidate.exists() and static_path is None:
+                static_path = candidate
+
+        self.atmos_chunks.sort(key=lambda x: x[0])
+
+        if static_path is None:
+            raise FileNotFoundError("No static.nc found in any data directory")
+
+        # Load static vars once (small, reused every sample)
+        static_ds = xr.open_dataset(static_path, engine="netcdf4")
+        self.static_vars = {
+            STATIC_ERA5_TO_AURORA[k]: torch.from_numpy(static_ds[k].values[0]).float()
+            for k in STATIC_ERA5_TO_AURORA
+        }
+        self.lat = torch.from_numpy(static_ds.latitude.values).float()
+        self.lon = torch.from_numpy(static_ds.longitude.values).float()
+        static_ds.close()
+
+        # Build list of valid triplets
+        self.triplets = self._build_triplets(start_date, end_date)
+
+    def _build_triplets(
+        self,
+        start_date: datetime | None,
+        end_date: datetime | None,
+    ) -> list[tuple[datetime, datetime, datetime]]:
+        """Enumerate all valid (t-step, t, t+step) triplets within the date range."""
+        step = timedelta(hours=self.step_hours)
+        triplets = []
+
+        for (year, month), surf_path in sorted(self.surface_files.items()):
+            n_days = calendar.monthrange(year, month)[1]
+            month_start = datetime(year, month, 1, 0, 0)
+            month_end = datetime(year, month, n_days, 23, 0)
+
+            # Iterate every hour in this month as the "current" time t1
+            t1 = month_start + step  # earliest t1 so that t0 = t1-step is in range
+            while t1 + step <= month_end:
+                t0 = t1 - step
+                t2 = t1 + step
+
+                # Apply date range filter (on t1, the "current" time)
+                if start_date and t1 < start_date:
+                    t1 += timedelta(hours=1)
+                    continue
+                if end_date and t1 >= end_date:
+                    break
+
+                # Check that all 3 timestamps are in the same month (surface file)
+                if t0.month != month or t2.month != month:
+                    t1 += timedelta(hours=1)
+                    continue
+
+                # Check atmospheric file coverage for all 3 timestamps
+                if (
+                    _find_atmos_file(t0, self.atmos_chunks) is not None
+                    and _find_atmos_file(t1, self.atmos_chunks) is not None
+                    and _find_atmos_file(t2, self.atmos_chunks) is not None
+                ):
+                    triplets.append((t0, t1, t2))
+
+                t1 += timedelta(hours=1)
+
+        return triplets
+
+    def __len__(self) -> int:
+        return len(self.triplets)
+
+    def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
+        """Load surface variables for a single timestamp."""
+        key = (dt.year, dt.month)
+        path = self.surface_files[key]
+        ds = xr.open_dataset(path, engine="netcdf4")
+        idx = _surface_time_index(dt)
+        result = {}
+        for era5_name, aurora_name in self.surf_map.items():
+            result[aurora_name] = torch.from_numpy(
+                ds[era5_name].values[idx]
+            ).float()
+        ds.close()
+        return result
+
+    def _load_atmos(self, dt: datetime) -> dict[str, torch.Tensor]:
+        """Load atmospheric variables for a single timestamp."""
+        info = _find_atmos_file(dt, self.atmos_chunks)
+        assert info is not None
+        path, time_idx = info
+        ds = xr.open_dataset(path, engine="netcdf4")
+        result = {}
+        for era5_name, aurora_name in ATMOS_ERA5_TO_AURORA.items():
+            result[aurora_name] = torch.from_numpy(
+                ds[era5_name].values[time_idx]
+            ).float()
+        ds.close()
+        return result
+
+    def __getitem__(self, idx: int) -> tuple[Batch, Batch]:
+        t0, t1, t2 = self.triplets[idx]
+
+        # Load 3 timestamps
+        surf0, surf1, surf2 = (
+            self._load_surface(t0),
+            self._load_surface(t1),
+            self._load_surface(t2),
+        )
+        atmos0, atmos1, atmos2 = (
+            self._load_atmos(t0),
+            self._load_atmos(t1),
+            self._load_atmos(t2),
+        )
+
+        # Stack into history dimension: (2, H, W) for surf, (2, C, H, W) for atmos
+        # Then add batch dim: (1, 2, H, W) and (1, 2, C, H, W)
+        input_surf = {
+            k: torch.stack([surf0[k], surf1[k]])[None] for k in surf0
+        }
+        input_atmos = {
+            k: torch.stack([atmos0[k], atmos1[k]])[None] for k in atmos0
+        }
+
+        # Target: single timestep with batch dim: (1, 1, H, W) and (1, 1, C, H, W)
+        target_surf = {k: surf2[k][None, None] for k in surf2}
+        target_atmos = {k: atmos2[k][None, None] for k in atmos2}
+
+        atmos_levels = PRESSURE_LEVELS
+
+        input_batch = Batch(
+            surf_vars=input_surf,
+            static_vars=self.static_vars,
+            atmos_vars=input_atmos,
+            metadata=Metadata(
+                lat=self.lat,
+                lon=self.lon,
+                time=(t1,),
+                atmos_levels=atmos_levels,
+            ),
+        )
+
+        target_batch = Batch(
+            surf_vars=target_surf,
+            static_vars=self.static_vars,
+            atmos_vars=target_atmos,
+            metadata=Metadata(
+                lat=self.lat,
+                lon=self.lon,
+                time=(t2,),
+                atmos_levels=atmos_levels,
+            ),
+        )
+
+        return input_batch, target_batch
+
+
+# ---------------------------------------------------------------------------
+# Train / val / test split helper
+# ---------------------------------------------------------------------------
+
+def make_era5_splits(
+    data_dirs: str | Path | list[str | Path],
+    train_end: datetime,
+    val_end: datetime,
+    train_start: datetime | None = None,
+    step_hours: int = 6,
+    include_extra_surf: bool = True,
+) -> tuple[ERA5Dataset, ERA5Dataset, ERA5Dataset]:
+    """Create train / val / test splits by date range.
+
+    Train: [train_start, train_end)
+    Val:   [train_end, val_end)
+    Test:  [val_end, ...)
+    """
+    kwargs = dict(
+        data_dirs=data_dirs,
+        step_hours=step_hours,
+        include_extra_surf=include_extra_surf,
+    )
+    train_ds = ERA5Dataset(start_date=train_start, end_date=train_end, **kwargs)
+    val_ds = ERA5Dataset(start_date=train_end, end_date=val_end, **kwargs)
+    test_ds = ERA5Dataset(start_date=val_end, **kwargs)
+    return train_ds, val_ds, test_ds
+
+
+# ---------------------------------------------------------------------------
+# Random batch helpers (for testing without real data)
+# ---------------------------------------------------------------------------
 
 def make_random_batch(
     n_lat: int = 17,
