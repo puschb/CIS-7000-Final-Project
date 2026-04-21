@@ -218,29 +218,39 @@ class ERA5Dataset(Dataset):
         return len(self.triplets)
 
     def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
-        """Load surface variables for a single timestamp."""
+        """Load surface variables for a single timestamp.
+
+        Uses xarray .isel() for indexed reads so only the requested time
+        slice is read from disk, not the entire file.
+        """
         key = (dt.year, dt.month)
         path = self.surface_files[key]
         ds = xr.open_dataset(path, engine="netcdf4")
         idx = _surface_time_index(dt)
+        sliced = ds.isel(valid_time=idx)
         result = {}
         for era5_name, aurora_name in self.surf_map.items():
             result[aurora_name] = torch.from_numpy(
-                ds[era5_name].values[idx]
+                sliced[era5_name].values
             ).float()
         ds.close()
         return result
 
     def _load_atmos(self, dt: datetime) -> dict[str, torch.Tensor]:
-        """Load atmospheric variables for a single timestamp."""
+        """Load atmospheric variables for a single timestamp.
+
+        Uses xarray .isel() for indexed reads so only the requested time
+        slice is read from disk, not the entire file.
+        """
         info = _find_atmos_file(dt, self.atmos_chunks)
         assert info is not None
         path, time_idx = info
         ds = xr.open_dataset(path, engine="netcdf4")
+        sliced = ds.isel(valid_time=time_idx)
         result = {}
         for era5_name, aurora_name in ATMOS_ERA5_TO_AURORA.items():
             result[aurora_name] = torch.from_numpy(
-                ds[era5_name].values[time_idx]
+                sliced[era5_name].values
             ).float()
         ds.close()
         return result
