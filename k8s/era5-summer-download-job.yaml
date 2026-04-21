@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: era5-summer-download
+spec:
+  backoffLimit: 5
+  activeDeadlineSeconds: 604800  # 7 days
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: clone-repo
+          image: alpine/git
+          command:
+            - sh
+            - -c
+            - |
+              REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/CIS-7000-Final-Project.git"
+              git clone --depth 1 "$REPO_URL" /opt/repo
+          env:
+            - name: GITHUB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: github-secret
+                  key: user
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-secret
+                  key: password
+          volumeMounts:
+            - name: repo
+              mountPath: /opt/repo
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      containers:
+        - name: downloader
+          image: python:3.10-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install --quiet "cdsapi>=0.7.7" tqdm
+              echo "=== Downloading Jun-Aug 2024 ==="
+              python -u /opt/repo/scripts/download_era5.py \
+                --year 2024 --months 6 7 8 --out /mnt/data/era5/2024
+              echo "=== Downloading Jun-Aug 2025 ==="
+              python -u /opt/repo/scripts/download_era5.py \
+                --year 2025 --months 6 7 8 --out /mnt/data/era5/2025
+          env:
+            - name: CDSAPI_URL
+              valueFrom:
+                secretKeyRef:
+                  name: cds-api-key
+                  key: url
+            - name: CDSAPI_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cds-api-key
+                  key: key
+          volumeMounts:
+            - name: repo
+              mountPath: /opt/repo
+            - name: data
+              mountPath: /mnt/data
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: era5-summer-soil-moisture
