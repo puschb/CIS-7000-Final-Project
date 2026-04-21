@@ -167,6 +167,10 @@ class ERA5Dataset(Dataset):
         self.lon = torch.from_numpy(static_ds.longitude.values).float()
         static_ds.close()
 
+        # Cache for open xarray Dataset handles to avoid re-opening multi-GB
+        # files on every __getitem__ call.  Keys are file paths.
+        self._ds_cache: dict[Path, xr.Dataset] = {}
+
         # Build list of valid triplets
         self.triplets = self._build_triplets(start_date, end_date)
 
@@ -217,15 +221,17 @@ class ERA5Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.triplets)
 
-    def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
-        """Load surface variables for a single timestamp.
+    def _open_ds(self, path: Path) -> xr.Dataset:
+        """Return a cached xarray Dataset handle, opening the file only once."""
+        if path not in self._ds_cache:
+            self._ds_cache[path] = xr.open_dataset(path, engine="netcdf4")
+        return self._ds_cache[path]
 
-        Uses xarray .isel() for indexed reads so only the requested time
-        slice is read from disk, not the entire file.
-        """
+    def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
+        """Load surface variables for a single timestamp."""
         key = (dt.year, dt.month)
         path = self.surface_files[key]
-        ds = xr.open_dataset(path, engine="netcdf4")
+        ds = self._open_ds(path)
         idx = _surface_time_index(dt)
         sliced = ds.isel(valid_time=idx)
         result = {}
@@ -233,27 +239,27 @@ class ERA5Dataset(Dataset):
             result[aurora_name] = torch.from_numpy(
                 sliced[era5_name].values
             ).float()
-        ds.close()
         return result
 
     def _load_atmos(self, dt: datetime) -> dict[str, torch.Tensor]:
-        """Load atmospheric variables for a single timestamp.
-
-        Uses xarray .isel() for indexed reads so only the requested time
-        slice is read from disk, not the entire file.
-        """
+        """Load atmospheric variables for a single timestamp."""
         info = _find_atmos_file(dt, self.atmos_chunks)
         assert info is not None
         path, time_idx = info
-        ds = xr.open_dataset(path, engine="netcdf4")
+        ds = self._open_ds(path)
         sliced = ds.isel(valid_time=time_idx)
         result = {}
         for era5_name, aurora_name in ATMOS_ERA5_TO_AURORA.items():
             result[aurora_name] = torch.from_numpy(
                 sliced[era5_name].values
             ).float()
-        ds.close()
         return result
+
+    def close(self):
+        """Close all cached file handles."""
+        for ds in self._ds_cache.values():
+            ds.close()
+        self._ds_cache.clear()
 
     def __getitem__(self, idx: int) -> tuple[Batch, Batch]:
         t0, t1, t2 = self.triplets[idx]
