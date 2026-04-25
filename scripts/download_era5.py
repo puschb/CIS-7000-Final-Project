@@ -16,6 +16,7 @@ import argparse
 import calendar
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cdsapi
@@ -137,14 +138,14 @@ def main():
         help="Months to download (default: all 12)",
     )
     parser.add_argument("--out", required=True, help="Output directory")
+    parser.add_argument("--workers", type=int, default=1,
+        help="Number of parallel CDS downloads (default: 1)")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    c = cdsapi.Client()
     total_months = len(args.months)
-
     total_days = sum(calendar.monthrange(int(args.year), m)[1] for m in args.months)
     atmos_calls = sum(
         math.ceil(calendar.monthrange(int(args.year), m)[1] / ATMOS_CHUNK_DAYS)
@@ -155,45 +156,57 @@ def main():
     print(f"Year: {args.year}", flush=True)
     print(f"Months: {args.months}", flush=True)
     print(f"Output: {out_dir}", flush=True)
+    print(f"Workers: {args.workers}", flush=True)
     print(f"Surface vars: {len(SURFACE_VARS)}", flush=True)
     print(f"Atmospheric vars: {len(ATMOS_VARS)} × {len(PRESSURE_LEVELS)} levels", flush=True)
     print(f"Atmospheric chunk size: {ATMOS_CHUNK_DAYS} days", flush=True)
     print(f"API calls: {total_months} surface + {atmos_calls} atmos + 1 static = {total_calls}\n", flush=True)
 
     t_start = time.time()
+    year = args.year
 
-    # Build task queue: list of (label, callable) pairs
+    # Each task creates its own cdsapi.Client for thread safety.
     tasks: list[tuple[str, callable]] = []
 
-    tasks.append(("static", lambda: download_static(c, args.year, out_dir)))
+    tasks.append(("static", lambda: download_static(cdsapi.Client(), year, out_dir)))
 
     for month in args.months:
         m = month
         tasks.append((
-            f"surface {args.year}-{m:02d}",
-            lambda m=m: download_surface_month(c, args.year, m, out_dir),
+            f"surface {year}-{m:02d}",
+            lambda m=m: download_surface_month(cdsapi.Client(), year, m, out_dir),
         ))
-        n_days = calendar.monthrange(int(args.year), m)[1]
+        n_days = calendar.monthrange(int(year), m)[1]
         d = 1
         while d <= n_days:
             end = min(d + ATMOS_CHUNK_DAYS - 1, n_days)
             tasks.append((
-                f"atmos {args.year}-{m:02d} d{d:02d}-{end:02d}",
+                f"atmos {year}-{m:02d} d{d:02d}-{end:02d}",
                 lambda m=m, ds=d, de=end: download_atmos_chunk(
-                    c, args.year, m, ds, de, out_dir
+                    cdsapi.Client(), year, m, ds, de, out_dir
                 ),
             ))
             d = end + 1
 
-    while tasks:
-        label, fn = tasks.pop(0)
-
+    def _run_task(label, fn):
         try:
             print(f"[{label}]...", flush=True)
             fn()
+            return label, None
         except Exception as e:
             print(f"  FAILED ({label}), re-queuing: {e}", flush=True)
-            tasks.append((label, fn))
+            return label, fn
+
+    while tasks:
+        batch = tasks[:args.workers]
+        tasks = tasks[len(batch):]
+
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(_run_task, label, fn) for label, fn in batch]
+            for future in as_completed(futures):
+                label, retry_fn = future.result()
+                if retry_fn is not None:
+                    tasks.append((label, retry_fn))
 
     elapsed = time.time() - t_start
     nc_files = list(out_dir.glob("*.nc"))
