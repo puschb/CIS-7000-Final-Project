@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: copy-era5-data
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: copy
+        image: gitlab-registry.nrp-nautilus.io/prp/gsutil:latest
+        command:
+        - bash
+        - -c
+        - |
+          echo "=== Starting PVC copy ==="
+          echo "Source: /from (era5-summer-soil-moisture)"
+          echo "Target: /to (era5-summer-data-many-connect)"
+          echo ""
+          ls -lhR /from/
+          echo ""
+          echo "=== Copying... ==="
+          gsutil -m rsync -r -P /from/ /to/ 2>&1 | tee /to/copy-log.txt
+          echo ""
+          echo "=== Verifying ==="
+          echo "--- Source ---"
+          du -sh /from/era5/2024/ /from/era5/2025/ /from/ 2>/dev/null
+          echo "--- Target ---"
+          du -sh /to/era5/2024/ /to/era5/2025/ /to/ 2>/dev/null
+          echo ""
+          echo "=== Copy complete ==="
+        volumeMounts:
+        - name: source
+          mountPath: /from
+          readOnly: true
+        - name: target
+          mountPath: /to
+        resources:
+          requests:
+            cpu: "4"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "4Gi"
+      volumes:
+      - name: source
+        persistentVolumeClaim:
+          claimName: era5-summer-soil-moisture
+          readOnly: true
+      - name: target
+        persistentVolumeClaim:
+          claimName: era5-summer-data-many-connect

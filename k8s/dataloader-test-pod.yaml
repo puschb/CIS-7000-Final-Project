@@ -34,6 +34,7 @@ spec:
     - -c
     - |
       cd /opt/repo
+      export PYTHONPATH=/opt/repo
       echo "=== Files on PVC ==="
       ls -lh /mnt/data/era5/
       echo ""
@@ -55,5 +56,5 @@ spec:
     emptyDir: {}
   - name: data
     persistentVolumeClaim:
-      claimName: era5-2025-pretrain
+      claimName: era5-summer-data-many-connect
   restartPolicy: Never

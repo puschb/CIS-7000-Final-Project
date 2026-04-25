@@ -1,10 +1,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: era5-2025-download
+  name: compute-norm-stats
 spec:
-  backoffLimit: 5
-  activeDeadlineSeconds: 604800  # 7 days
+  backoffLimit: 2
+  activeDeadlineSeconds: 7200  # 2 hours (should finish in minutes)
   template:
     spec:
       restartPolicy: OnFailure
@@ -15,7 +15,7 @@ spec:
             - sh
             - -c
             - |
-              REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/CIS-7000-Final-Project.git"
+              REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/puschb/CIS-7000-Final-Project.git"
               git clone --depth 1 "$REPO_URL" /opt/repo
           env:
             - name: GITHUB_USER
@@ -39,26 +39,21 @@ spec:
               cpu: "500m"
               memory: "512Mi"
       containers:
-        - name: downloader
-          image: python:3.10-slim
+        - name: compute
+          image: puschb/aurora-dev:latest
           command:
             - sh
             - -c
             - |
-              pip install --quiet "cdsapi>=0.7.7" tqdm
-              python -u /opt/repo/scripts/download_era5.py \
-                --year 2026 --months 1 2 --out /mnt/data/era5
-          env:
-            - name: CDSAPI_URL
-              valueFrom:
-                secretKeyRef:
-                  name: cds-api-key
-                  key: url
-            - name: CDSAPI_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cds-api-key
-                  key: key
+              cd /opt/repo
+              export PYTHONPATH=/opt/repo
+              echo "=== Available data ==="
+              ls -lh /mnt/data/era5/2024/ 2>/dev/null || echo "No 2024 dir"
+              ls -lh /mnt/data/era5/2025/ 2>/dev/null || echo "No 2025 dir"
+              echo ""
+              echo "=== Computing normalisation stats (training split only) ==="
+              python -u scripts/compute_norm_stats.py \
+                --data-dir /mnt/data/era5/2024 /mnt/data/era5/2025
           volumeMounts:
             - name: repo
               mountPath: /opt/repo
@@ -66,14 +61,14 @@ spec:
               mountPath: /mnt/data
           resources:
             requests:
-              cpu: "1"
-              memory: "2Gi"
+              cpu: "2"
+              memory: "8Gi"
             limits:
-              cpu: "1"
-              memory: "2Gi"
+              cpu: "2"
+              memory: "8Gi"
       volumes:
         - name: repo
           emptyDir: {}
         - name: data
           persistentVolumeClaim:
-            claimName: era5-2025-pretrain
+            claimName: era5-summer-data-many-connect

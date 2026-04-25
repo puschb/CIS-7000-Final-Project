@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: inspect-chunks
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: inspect
+          image: puschb/aurora-dev:latest
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import xarray as xr, os, glob
+
+              data_root = "/mnt/data/era5"
+              print("=== Files on PVC ===")
+              for dirpath, dirs, files in os.walk(data_root):
+                  for f in sorted(files):
+                      fp = os.path.join(dirpath, f)
+                      sz = os.path.getsize(fp) / 1e9
+                      print(f"  {fp}  ({sz:.2f} GB)")
+              print()
+
+              # Find one surface file
+              nc_files = sorted(glob.glob(os.path.join(data_root, "**/*surface*.nc"), recursive=True))
+              if not nc_files:
+                  print("No surface NC files found!")
+              else:
+                  path = nc_files[0]
+                  print(f"=== Inspecting: {path} ===")
+                  ds = xr.open_dataset(path, engine="netcdf4")
+                  print(f"Dimensions: {dict(ds.dims)}")
+                  print(f"Variables:  {list(ds.data_vars)}")
+                  print(f"Chunks:     {ds.chunks}")
+                  print()
+                  for var in ds.data_vars:
+                      enc = ds[var].encoding
+                      print(f"  {var}:")
+                      print(f"    shape      = {ds[var].shape}")
+                      print(f"    dtype      = {ds[var].dtype}")
+                      print(f"    chunksizes = {enc.get('chunksizes', 'NOT SET')}")
+                      print(f"    contiguous = {enc.get('contiguous', 'N/A')}")
+                      print(f"    filters    = {enc.get('complevel', 0)}")
+                  ds.close()
+
+              # Also check an atmospheric file
+              atmos_files = sorted(glob.glob(os.path.join(data_root, "**/*atmospheric*.nc"), recursive=True))
+              if atmos_files:
+                  path = atmos_files[0]
+                  print(f"\n=== Inspecting: {path} ===")
+                  ds = xr.open_dataset(path, engine="netcdf4")
+                  print(f"Dimensions: {dict(ds.dims)}")
+                  print(f"Variables:  {list(ds.data_vars)}")
+                  print(f"Chunks:     {ds.chunks}")
+                  print()
+                  for var in ds.data_vars:
+                      enc = ds[var].encoding
+                      print(f"  {var}:")
+                      print(f"    shape      = {ds[var].shape}")
+                      print(f"    dtype      = {ds[var].dtype}")
+                      print(f"    chunksizes = {enc.get('chunksizes', 'NOT SET')}")
+                      print(f"    contiguous = {enc.get('contiguous', 'N/A')}")
+                  ds.close()
+          volumeMounts:
+            - name: data
+              mountPath: /mnt/data
+          resources:
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+            limits:
+              cpu: "1"
+              memory: "4Gi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: era5-summer-data-many-connect

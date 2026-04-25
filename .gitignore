@@ -214,3 +214,5 @@ checkpoints/
 
 # HuggingFace cache
 .cache/huggingface/
+
+./mcp-unlock-pdf/*
