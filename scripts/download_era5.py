@@ -19,7 +19,6 @@ import time
 from pathlib import Path
 
 import cdsapi
-from tqdm import tqdm
 
 SURFACE_VARS = [
     "2m_temperature",
@@ -130,21 +129,6 @@ def download_atmos_chunk(
     )
 
 
-def download_atmos_month(c: cdsapi.Client, year: str, month: int, out_dir: Path, pbar: tqdm):
-    """Download atmospheric variables for one month in 3-day chunks."""
-    n_days = calendar.monthrange(int(year), month)[1]
-    chunks = []
-    d = 1
-    while d <= n_days:
-        end = min(d + ATMOS_CHUNK_DAYS - 1, n_days)
-        chunks.append((d, end))
-        d = end + 1
-
-    for day_start, day_end in chunks:
-        download_atmos_chunk(c, year, month, day_start, day_end, out_dir)
-        pbar.update(day_end - day_start + 1)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Download ERA5 data (bulk)")
     parser.add_argument("--year", required=True, help="Year to download (e.g. 2025)")
@@ -178,21 +162,38 @@ def main():
 
     t_start = time.time()
 
-    print("[static]", flush=True)
-    download_static(c, args.year, out_dir)
+    # Build task queue: list of (label, callable) pairs
+    tasks: list[tuple[str, callable]] = []
 
-    pbar = tqdm(total=total_days, unit="day", desc="Downloading ERA5")
+    tasks.append(("static", lambda: download_static(c, args.year, out_dir)))
+
     for month in args.months:
-        month_name = calendar.month_abbr[month]
-        n_days = calendar.monthrange(int(args.year), month)[1]
+        m = month
+        tasks.append((
+            f"surface {args.year}-{m:02d}",
+            lambda m=m: download_surface_month(c, args.year, m, out_dir),
+        ))
+        n_days = calendar.monthrange(int(args.year), m)[1]
+        d = 1
+        while d <= n_days:
+            end = min(d + ATMOS_CHUNK_DAYS - 1, n_days)
+            tasks.append((
+                f"atmos {args.year}-{m:02d} d{d:02d}-{end:02d}",
+                lambda m=m, ds=d, de=end: download_atmos_chunk(
+                    c, args.year, m, ds, de, out_dir
+                ),
+            ))
+            d = end + 1
 
-        tqdm.write(f"\n[{args.year}-{month:02d}] {month_name} — surface")
-        download_surface_month(c, args.year, month, out_dir)
+    while tasks:
+        label, fn = tasks.pop(0)
 
-        tqdm.write(f"[{args.year}-{month:02d}] {month_name} — atmospheric")
-        download_atmos_month(c, args.year, month, out_dir, pbar)
-
-    pbar.close()
+        try:
+            print(f"[{label}]...", flush=True)
+            fn()
+        except Exception as e:
+            print(f"  FAILED ({label}), re-queuing: {e}", flush=True)
+            tasks.append((label, fn))
 
     elapsed = time.time() - t_start
     nc_files = list(out_dir.glob("*.nc"))

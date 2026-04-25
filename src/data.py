@@ -322,28 +322,116 @@ class ERA5Dataset(Dataset):
 # Train / val / test split helper
 # ---------------------------------------------------------------------------
 
+# Default split for the soil-moisture fine-tuning task.
+#
+# Data: Jun-Aug 2024 and Jun-Aug 2025 (summer only, two years).
+#   Train : Jun 1 – Aug 1    both years  (~122 days, 66%)
+#   Val   : Aug 1 – Aug 16   both years  (~30 days,  17%)
+#   Test  : Aug 16 – Sep 1   both years  (~32 days,  17%)
+#
+# Val and test draw from both years so any performance difference reflects
+# generalization quality, not inter-annual weather variability.
+DEFAULT_TRAIN_RANGES: list[tuple[datetime, datetime]] = [
+    (datetime(2024, 6, 1), datetime(2024, 8, 1)),   # Jun+Jul 2024
+    (datetime(2025, 6, 1), datetime(2025, 8, 1)),   # Jun+Jul 2025
+]
+DEFAULT_VAL_RANGES: list[tuple[datetime, datetime]] = [
+    (datetime(2024, 8, 1), datetime(2024, 8, 16)),  # Aug 1-15 2024
+    (datetime(2025, 8, 1), datetime(2025, 8, 16)),  # Aug 1-15 2025
+]
+DEFAULT_TEST_RANGES: list[tuple[datetime, datetime]] = [
+    (datetime(2024, 8, 16), datetime(2024, 9, 1)),  # Aug 16-31 2024
+    (datetime(2025, 8, 16), datetime(2025, 9, 1)),  # Aug 16-31 2025
+]
+
+
+class MultiRangeERA5Dataset(Dataset):
+    """Thin wrapper that concatenates multiple date-range slices of ERA5Dataset.
+
+    Useful when train/val/test splits are non-contiguous (e.g. summer months
+    across multiple years).
+    """
+
+    def __init__(
+        self,
+        data_dirs: str | Path | list[str | Path],
+        date_ranges: list[tuple[datetime, datetime]],
+        step_hours: int = 6,
+        include_extra_surf: bool = True,
+    ):
+        self.datasets: list[ERA5Dataset] = []
+        self._lengths: list[int] = []
+
+        for start, end in date_ranges:
+            ds = ERA5Dataset(
+                data_dirs=data_dirs,
+                start_date=start,
+                end_date=end,
+                step_hours=step_hours,
+                include_extra_surf=include_extra_surf,
+            )
+            self.datasets.append(ds)
+            self._lengths.append(len(ds))
+
+        self._cumulative = []
+        total = 0
+        for length in self._lengths:
+            total += length
+            self._cumulative.append(total)
+
+    def __len__(self) -> int:
+        return self._cumulative[-1] if self._cumulative else 0
+
+    def __getitem__(self, idx: int) -> tuple[Batch, Batch]:
+        for ds_idx, cum_len in enumerate(self._cumulative):
+            if idx < cum_len:
+                offset = cum_len - self._lengths[ds_idx]
+                return self.datasets[ds_idx][idx - offset]
+        raise IndexError(f"index {idx} out of range for dataset of length {len(self)}")
+
+    @property
+    def triplets(self) -> list:
+        """All triplets across sub-datasets (for inspection / debugging)."""
+        out = []
+        for ds in self.datasets:
+            out.extend(ds.triplets)
+        return out
+
+    def close(self):
+        for ds in self.datasets:
+            ds.close()
+
+
 def make_era5_splits(
     data_dirs: str | Path | list[str | Path],
-    train_end: datetime,
-    val_end: datetime,
-    train_start: datetime | None = None,
+    train_ranges: list[tuple[datetime, datetime]] | None = None,
+    val_ranges: list[tuple[datetime, datetime]] | None = None,
+    test_ranges: list[tuple[datetime, datetime]] | None = None,
     step_hours: int = 6,
     include_extra_surf: bool = True,
-) -> tuple[ERA5Dataset, ERA5Dataset, ERA5Dataset]:
-    """Create train / val / test splits by date range.
+) -> tuple[MultiRangeERA5Dataset, MultiRangeERA5Dataset, MultiRangeERA5Dataset]:
+    """Create train / val / test splits from (possibly non-contiguous) date ranges.
 
-    Train: [train_start, train_end)
-    Val:   [train_end, val_end)
-    Test:  [val_end, ...)
+    Defaults to the soil-moisture summer split:
+        Train : Jun+Jul 2024, Jun+Jul 2025
+        Val   : Aug 1-15 2024, Aug 1-15 2025
+        Test  : Aug 16-31 2024, Aug 16-31 2025
     """
+    if train_ranges is None:
+        train_ranges = DEFAULT_TRAIN_RANGES
+    if val_ranges is None:
+        val_ranges = DEFAULT_VAL_RANGES
+    if test_ranges is None:
+        test_ranges = DEFAULT_TEST_RANGES
+
     kwargs = dict(
         data_dirs=data_dirs,
         step_hours=step_hours,
         include_extra_surf=include_extra_surf,
     )
-    train_ds = ERA5Dataset(start_date=train_start, end_date=train_end, **kwargs)
-    val_ds = ERA5Dataset(start_date=train_end, end_date=val_end, **kwargs)
-    test_ds = ERA5Dataset(start_date=val_end, **kwargs)
+    train_ds = MultiRangeERA5Dataset(date_ranges=train_ranges, **kwargs)
+    val_ds = MultiRangeERA5Dataset(date_ranges=val_ranges, **kwargs)
+    test_ds = MultiRangeERA5Dataset(date_ranges=test_ranges, **kwargs)
     return train_ds, val_ds, test_ds
 
 
@@ -356,6 +444,7 @@ def make_random_batch(
     n_lon: int = 32,
     n_levels: int = 4,
     batch_size: int = 1,
+    include_extra_surf: bool = True,
 ) -> Batch:
     """Create a random batch for testing.
 
@@ -363,9 +452,12 @@ def make_random_batch(
     Set n_lat=721, n_lon=1440, n_levels=13 for full 0.25-degree resolution.
     """
     levels = PRESSURE_LEVELS[:n_levels]
+    surf_keys = SURF_VAR_NAMES
+    if include_extra_surf:
+        surf_keys = surf_keys + tuple(EXTRA_SURF_ERA5_TO_AURORA.values())
 
     return Batch(
-        surf_vars={k: torch.randn(batch_size, 2, n_lat, n_lon) for k in SURF_VAR_NAMES},
+        surf_vars={k: torch.randn(batch_size, 2, n_lat, n_lon) for k in surf_keys},
         static_vars={k: torch.randn(n_lat, n_lon) for k in STATIC_VAR_NAMES},
         atmos_vars={
             k: torch.randn(batch_size, 2, n_levels, n_lat, n_lon) for k in ATMOS_VAR_NAMES
@@ -387,6 +479,7 @@ def make_random_batch_sequence(
     batch_size: int = 1,
     start_time: datetime | None = None,
     step_hours: int = 6,
+    include_extra_surf: bool = True,
 ) -> list[Batch]:
     """Create a sequence of random batches for testing multi-step fine-tuning.
 
@@ -397,13 +490,16 @@ def make_random_batch_sequence(
         start_time = datetime(2020, 6, 1, 0, 0)
 
     levels = PRESSURE_LEVELS[:n_levels]
+    surf_keys = SURF_VAR_NAMES
+    if include_extra_surf:
+        surf_keys = surf_keys + tuple(EXTRA_SURF_ERA5_TO_AURORA.values())
     batches = []
 
     for i in range(steps):
         t = start_time + timedelta(hours=step_hours * i)
         batch = Batch(
             surf_vars={
-                k: torch.randn(batch_size, 2, n_lat, n_lon) for k in SURF_VAR_NAMES
+                k: torch.randn(batch_size, 2, n_lat, n_lon) for k in surf_keys
             },
             static_vars={k: torch.randn(n_lat, n_lon) for k in STATIC_VAR_NAMES},
             atmos_vars={

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: era5-summer-download
+  name: era5-jun-jul-download
 spec:
   backoffLimit: 5
   activeDeadlineSeconds: 604800  # 7 days
@@ -15,7 +15,7 @@ spec:
             - sh
             - -c
             - |
-              REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/CIS-7000-Final-Project.git"
+              REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/puschb/CIS-7000-Final-Project.git"
               git clone --depth 1 "$REPO_URL" /opt/repo
           env:
             - name: GITHUB_USER
@@ -45,13 +45,16 @@ spec:
             - sh
             - -c
             - |
-              pip install --quiet "cdsapi>=0.7.7" tqdm
-              echo "=== Downloading Jun-Aug 2024 ==="
-              python -u /opt/repo/scripts/download_era5.py \
-                --year 2024 --months 6 7 8 --out /mnt/data/era5/2024
-              echo "=== Downloading Jun-Aug 2025 ==="
-              python -u /opt/repo/scripts/download_era5.py \
-                --year 2025 --months 6 7 8 --out /mnt/data/era5/2025
+              pip install --quiet "cdsapi>=0.7.7"
+              {
+                echo "=== Downloading Jun-Jul 2024 ==="
+                python -u /opt/repo/scripts/download_era5.py \
+                  --year 2024 --months 6 7 --out /mnt/data/era5/2024
+                echo "=== Downloading Jun-Jul 2025 ==="
+                python -u /opt/repo/scripts/download_era5.py \
+                  --year 2025 --months 6 7 --out /mnt/data/era5/2025
+                echo "=== Download complete ==="
+              } 2>&1 | tee /mnt/data/era5/download-log.txt
           env:
             - name: CDSAPI_URL
               valueFrom:
@@ -80,4 +83,4 @@ spec:
           emptyDir: {}
         - name: data
           persistentVolumeClaim:
-            claimName: era5-summer-soil-moisture
+            claimName: era5-summer-data-many-connect
