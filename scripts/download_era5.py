@@ -16,7 +16,7 @@ import argparse
 import calendar
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import cdsapi
@@ -197,16 +197,23 @@ def main():
             print(f"  FAILED ({label}), re-queuing: {e}", flush=True)
             return label, fn
 
-    while tasks:
-        batch = tasks[:args.workers]
-        tasks = tasks[len(batch):]
+    pending = list(tasks)
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {}
+        for _ in range(min(args.workers, len(pending))):
+            label, fn = pending.pop(0)
+            futures[pool.submit(_run_task, label, fn)] = label
 
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(_run_task, label, fn) for label, fn in batch]
-            for future in as_completed(futures):
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                del futures[future]
                 label, retry_fn = future.result()
                 if retry_fn is not None:
-                    tasks.append((label, retry_fn))
+                    pending.append((label, retry_fn))
+                if pending:
+                    next_label, next_fn = pending.pop(0)
+                    futures[pool.submit(_run_task, next_label, next_fn)] = next_label
 
     elapsed = time.time() - t_start
     nc_files = list(out_dir.glob("*.nc"))
