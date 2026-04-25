@@ -14,7 +14,9 @@ from torch.utils.data import Dataset
 
 from aurora import Batch, Metadata
 
-SURF_VAR_NAMES = ("2t", "10u", "10v", "msl")
+BASE_SURF_VAR_NAMES = ("2t", "10u", "10v", "msl")
+EXTRA_SURF_VAR_NAMES = ("swvl1", "stl1", "sd")
+SURF_VAR_NAMES = BASE_SURF_VAR_NAMES + EXTRA_SURF_VAR_NAMES
 STATIC_VAR_NAMES = ("lsm", "z", "slt")
 ATMOS_VAR_NAMES = ("z", "u", "v", "t", "q")
 PRESSURE_LEVELS = (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000)
@@ -51,7 +53,6 @@ ATMOS_ERA5_TO_AURORA = {
     "q": "q",
     "z": "z",
 }
-
 
 # ---------------------------------------------------------------------------
 # File index helpers
@@ -129,6 +130,8 @@ class ERA5Dataset(Dataset):
         end_date: datetime | None = None,
         step_hours: int = 6,
         include_extra_surf: bool = True,
+        input_surf_vars: tuple[str, ...] | list[str] | None = None,
+        target_surf_vars: tuple[str, ...] | list[str] | None = None,
     ):
         if isinstance(data_dirs, (str, Path)):
             data_dirs = [data_dirs]
@@ -136,9 +139,29 @@ class ERA5Dataset(Dataset):
         self.step_hours = step_hours
         self.include_extra_surf = include_extra_surf
 
-        self.surf_map = SURF_ERA5_TO_AURORA.copy()
+        available_surf_vars = set(BASE_SURF_VAR_NAMES)
         if include_extra_surf:
-            self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
+            available_surf_vars.update(EXTRA_SURF_VAR_NAMES)
+
+        if input_surf_vars is None:
+            input_surf_vars = SURF_VAR_NAMES if include_extra_surf else BASE_SURF_VAR_NAMES
+        if target_surf_vars is None:
+            target_surf_vars = input_surf_vars
+
+        self.input_surf_vars = tuple(input_surf_vars)
+        self.target_surf_vars = tuple(target_surf_vars)
+
+        unknown_input = set(self.input_surf_vars) - available_surf_vars
+        unknown_target = set(self.target_surf_vars) - available_surf_vars
+        if unknown_input or unknown_target:
+            raise ValueError(
+                "Requested unavailable surface vars. "
+                f"input={sorted(unknown_input)} target={sorted(unknown_target)} "
+                f"available={sorted(available_surf_vars)}"
+            )
+
+        self.surf_map = SURF_ERA5_TO_AURORA.copy()
+        self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
 
         # Build file indices across all data directories
         self.surface_files: dict[tuple[int, int], Path] = {}
@@ -227,7 +250,11 @@ class ERA5Dataset(Dataset):
             self._ds_cache[path] = xr.open_dataset(path, engine="netcdf4")
         return self._ds_cache[path]
 
-    def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
+    def _load_surface(
+        self,
+        dt: datetime,
+        var_names: tuple[str, ...] | list[str],
+    ) -> dict[str, torch.Tensor]:
         """Load surface variables for a single timestamp."""
         key = (dt.year, dt.month)
         path = self.surface_files[key]
@@ -235,7 +262,10 @@ class ERA5Dataset(Dataset):
         idx = _surface_time_index(dt)
         sliced = ds.isel(valid_time=idx)
         result = {}
+        requested = set(var_names)
         for era5_name, aurora_name in self.surf_map.items():
+            if aurora_name not in requested:
+                continue
             result[aurora_name] = torch.from_numpy(
                 sliced[era5_name].values
             ).float()
@@ -266,9 +296,9 @@ class ERA5Dataset(Dataset):
 
         # Load 3 timestamps
         surf0, surf1, surf2 = (
-            self._load_surface(t0),
-            self._load_surface(t1),
-            self._load_surface(t2),
+            self._load_surface(t0, self.input_surf_vars),
+            self._load_surface(t1, self.input_surf_vars),
+            self._load_surface(t2, self.target_surf_vars),
         )
         atmos0, atmos1, atmos2 = (
             self._load_atmos(t0),
