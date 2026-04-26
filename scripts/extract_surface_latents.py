@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +34,10 @@ import torch
 from torch import nn
 
 from aurora import AuroraPretrained, AuroraSmallPretrained
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.data import BASE_SURF_VAR_NAMES, ERA5Dataset
 

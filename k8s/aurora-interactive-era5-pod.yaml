@@ -1,0 +1,87 @@
+# GPU interactive pod for AuroraSmall with the era5-rechunked PVC mounted at /mnt/data.
+# This version requests a generic single NVIDIA GPU and allows common 48 GB+
+# products instead of hard-pinning to A100 80GB nodes.
+#
+# Usage:
+#   kubectl delete pod aurora-dev-era5 --ignore-not-found=true
+#   kubectl create -f k8s/aurora-interactive-era5-pod.yaml
+#   kubectl wait --for=condition=Ready pod/aurora-dev-era5 --timeout=600s
+#   kubectl exec -it aurora-dev-era5 -- /bin/bash -c 'cd /opt/repo && exec bash'
+#   kubectl delete pod aurora-dev-era5
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aurora-dev-era5
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: nvidia.com/gpu.product
+            operator: In
+            values:
+            - NVIDIA-A40
+            - NVIDIA-RTX-A6000
+            - NVIDIA-L40
+            - NVIDIA-L40S
+            - NVIDIA-A100-SXM4-80GB
+  initContainers:
+  - name: clone-repo
+    image: alpine/git
+    env:
+    - name: GIT_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: user
+    - name: GIT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: password
+    args:
+    - clone
+    - --single-branch
+    - --depth=1
+    - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+    - /opt/repo
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+  containers:
+  - name: aurora-dev
+    image: puschb/aurora-dev:latest
+    command: ["sh", "-c", "echo \"url: $CDS_URL\nkey: $CDS_KEY\" > ~/.cdsapirc && cd /opt/repo && echo 'Ready — repo cloned, aurora installed, era5-rechunked mounted at /mnt/data.' && sleep infinity"]
+    env:
+    - name: CDS_URL
+      valueFrom:
+        secretKeyRef:
+          name: cds-api-key
+          key: url
+    - name: CDS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: cds-api-key
+          key: key
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+    - name: era5-data
+      mountPath: /mnt/data
+    resources:
+      requests:
+        memory: 32Gi
+        cpu: "4"
+        nvidia.com/gpu: "1"
+      limits:
+        memory: 32Gi
+        cpu: "4"
+        nvidia.com/gpu: "1"
+  volumes:
+  - name: repo
+    emptyDir: {}
+  - name: era5-data
+    persistentVolumeClaim:
+      claimName: era5-rechunked
+  restartPolicy: Never
