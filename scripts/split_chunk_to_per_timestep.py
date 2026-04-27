@@ -81,12 +81,20 @@ def main() -> None:
     print()
 
     written = 0
+    skipped = 0
     t_loop = time.perf_counter()
     for i in range(nt):
         atmos_one = atmos.isel(valid_time=[i])
         t_val = atmos_one["valid_time"].values.item()
         dt = _to_naive_utc(t_val)
         stem = dt.strftime("%Y-%m-%dT%H")
+
+        surf_path = out / f"{stem}-surface.nc"
+        atmos_path = out / f"{stem}-atmospheric.nc"
+
+        if surf_path.exists() and atmos_path.exists():
+            skipped += 1
+            continue
 
         surf_one = surf.sel(valid_time=atmos_one["valid_time"], drop=True)
         if int(surf_one.sizes["valid_time"]) != 1:
@@ -95,21 +103,18 @@ def main() -> None:
                 f"{surf_one.sizes['valid_time']}, expected 1"
             )
 
-        surf_path = out / f"{stem}-surface.nc"
-        atmos_path = out / f"{stem}-atmospheric.nc"
-
         surf_one.to_netcdf(surf_path, encoding=_encoding_for(surf_one))
         atmos_one.to_netcdf(atmos_path, encoding=_encoding_for(atmos_one))
         written += 1
 
         if (i + 1) % 12 == 0 or i + 1 == nt:
             elapsed = time.perf_counter() - t_loop
-            print(f"  {i + 1}/{nt}  ({written} pairs)  elapsed {elapsed:.1f}s")
+            print(f"  {i + 1}/{nt}  ({written} written, {skipped} skipped)  elapsed {elapsed:.1f}s")
 
     atmos.close()
     surf.close()
     print()
-    print(f"Done. Wrote {written} surface + {written} atmospheric files in {out}")
+    print(f"Done. Wrote {written} new + {skipped} already-existing pairs in {out}")
     print(f"Total wall time: {time.perf_counter() - t0:.1f}s")
 
 
