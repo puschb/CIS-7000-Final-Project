@@ -65,12 +65,12 @@ _NEW_VAR_NORM: dict[str, tuple[float, float]] = {
 
 ### Data available
 
-Summer ERA5 data (Jun–Aug) across two years, downloaded onto the `era5-summer-soil-moisture` PVC:
+Summer ERA5 data (Jun–Jul) across two years, downloaded onto the `era5-rechunked` PVC:
 
 | Year | Months | PVC path |
 |---|---|---|
-| 2024 | Jun, Jul, Aug | `/mnt/data/era5/2024/` |
-| 2025 | Jun, Jul, Aug | `/mnt/data/era5/2025/` |
+| 2024 | Jun, Jul | `/mnt/data/era5/2024/` |
+| 2025 | Jun, Jul | `/mnt/data/era5/2025/` |
 
 Each month contains:
 - `YYYY-MM-surface.nc` — all 7 surface variables (4 standard + 3 new) × 24 hourly timesteps × all days
@@ -79,11 +79,11 @@ Each month contains:
 
 ### Split definition
 
-| Split | Date range | Days | % |
+| Split | Date range | Days | Approx. samples |
 |---|---|---|---|
-| **Train** | Jun 1 – Aug 1, 2024 + Jun 1 – Aug 1, 2025 | ~122 | 66% |
-| **Val** | Aug 1 – Aug 16, 2024 + Aug 1 – Aug 16, 2025 | ~30 | 17% |
-| **Test** | Aug 16 – Sep 1, 2024 + Aug 16 – Sep 1, 2025 | ~32 | 17% |
+| **Train** | Jun 1 – Jul 1, 2024 + Jun 1 – Jul 1, 2025 | 60 | ~1,400 |
+| **Val** | Jul 1 – Jul 16, 2024 + Jul 1 – Jul 16, 2025 | 30 | ~700 |
+| **Test** | Jul 16 – Aug 1, 2024 + Jul 16 – Aug 1, 2025 | 30 | ~700 |
 
 All ranges are `[start, end)` — the end date is exclusive.
 
@@ -91,8 +91,8 @@ All ranges are `[start, end)` — the end date is exclusive.
 
 - **Training on both years** exposes the model to inter-annual variability in soil moisture patterns (e.g., different drought/wet conditions in 2024 vs 2025).
 - **Val and test draw from both years**, so any performance difference reflects generalization quality, not inter-annual weather variability.
-- **Val and test are both August** (same seasonal regime as late training), so differences reflect temporal generalization, not seasonal mismatch.
-- The download covers Jun–Aug only (no September data exists), so `datetime(2024, 9, 1)` as the exclusive end captures all of August.
+- **Val and test are both July** (same seasonal regime as late training), so differences reflect temporal generalization, not seasonal mismatch.
+- The download covers Jun–Jul only, so `datetime(2024, 8, 1)` as the exclusive end captures all of July.
 
 ### Usage in code
 
@@ -119,29 +119,30 @@ from src.data import make_era5_splits
 train_ds, val_ds, test_ds = make_era5_splits(
     data_dirs=["/mnt/data/era5/2024", "/mnt/data/era5/2025"],
     train_ranges=[
-        (datetime(2024, 6, 1), datetime(2024, 8, 1)),
-        (datetime(2025, 6, 1), datetime(2025, 8, 1)),
+        (datetime(2024, 6, 1), datetime(2024, 7, 1)),
+        (datetime(2025, 6, 1), datetime(2025, 7, 1)),
     ],
     val_ranges=[
-        (datetime(2024, 8, 1), datetime(2024, 8, 16)),
-        (datetime(2025, 8, 1), datetime(2025, 8, 16)),
+        (datetime(2024, 7, 1), datetime(2024, 7, 16)),
+        (datetime(2025, 7, 1), datetime(2025, 7, 16)),
     ],
     test_ranges=[
-        (datetime(2024, 8, 16), datetime(2024, 9, 1)),
-        (datetime(2025, 8, 16), datetime(2025, 9, 1)),
+        (datetime(2024, 7, 16), datetime(2024, 8, 1)),
+        (datetime(2025, 7, 16), datetime(2025, 8, 1)),
     ],
 )
 ```
 
 ### Sample counts (estimated)
 
-With 6-hour step size and all 24 hourly timesteps per day:
+With 6-hour step size and all 24 hourly timesteps per day, a "sample" is a valid
+sequence (t−6h, t, t+6h, ...) where all timestamps fall within the same month:
 
-| Split | Days | Hourly timestamps | Valid 6h triplets (approx) |
+| Split | Days | Hourly timestamps | Valid samples (approx) |
 |---|---|---|---|
-| Train | ~122 (61 × 2 yr) | ~2,928 | ~2,800 |
-| Val | ~30 (15 × 2 yr) | ~720 | ~690 |
-| Test | ~32 (16 × 2 yr) | ~768 | ~740 |
+| Train | 60 (30 × 2 yr) | ~1,440 | ~1,400 |
+| Val | 30 (15 × 2 yr) | ~720 | ~700 |
+| Test | 30 (15 × 2 yr) | ~720 | ~700 |
 
 ---
 
@@ -177,7 +178,7 @@ Per the Aurora docs, use a **higher learning rate for new patch embeddings** (e.
 
 ## Checklist
 
-- [ ] Download job completes for all 6 months (Jun–Aug 2024 + Jun–Aug 2025)
+- [ ] Download job completes for all 4 months (Jun–Jul 2024 + Jun–Jul 2025)
 - [ ] Run `compute-norm-stats` job on the cluster
 - [ ] Paste normalisation values into `src/finetune.py`
-- [ ] Run fine-tuning
+- [ ] Run fine-tuning (see `docs/finetuning_plan.md` and `docs/data_pipeline.md`)

@@ -228,7 +228,8 @@ def run_epoch(
     n_steps = 0
 
     for idx in indices:
-        input_batch, target_batch = dataset[idx]
+        input_batch, targets = dataset[idx]
+        target_batch = targets[0]
         target = extract_targets(target_batch, target_vars, device=device)
         target_hw = (target.shape[-2], target.shape[-1])
 

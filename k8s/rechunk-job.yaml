@@ -1,0 +1,129 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rechunk-era5-v4
+spec:
+  completionMode: Indexed
+  completions: 25
+  parallelism: 10
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                - us-west
+      containers:
+        - name: rechunk
+          image: python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+
+              pip install -q xarray netcdf4
+
+              FILES=(
+                "2024/2024-07-d01-03-atmospheric.nc"
+                "2024/2024-07-d04-06-atmospheric.nc"
+                "2024/2024-07-d07-09-atmospheric.nc"
+                "2024/2024-07-d10-12-atmospheric.nc"
+                "2024/2024-07-d13-15-atmospheric.nc"
+                "2024/2024-07-d16-18-atmospheric.nc"
+                "2024/2024-07-d19-21-atmospheric.nc"
+                "2024/2024-07-d22-24-atmospheric.nc"
+                "2024/2024-07-d25-27-atmospheric.nc"
+                "2024/2024-07-d28-30-atmospheric.nc"
+                "2024/2024-07-d31-31-atmospheric.nc"
+                "2025/2025-06-d13-15-atmospheric.nc"
+                "2025/2025-06-d22-24-atmospheric.nc"
+                "2025/2025-06-d28-30-atmospheric.nc"
+                "2025/2025-07-d01-03-atmospheric.nc"
+                "2025/2025-07-d04-06-atmospheric.nc"
+                "2025/2025-07-d07-09-atmospheric.nc"
+                "2025/2025-07-d10-12-atmospheric.nc"
+                "2025/2025-07-d13-15-atmospheric.nc"
+                "2025/2025-07-d16-18-atmospheric.nc"
+                "2025/2025-07-d19-21-atmospheric.nc"
+                "2025/2025-07-d22-24-atmospheric.nc"
+                "2025/2025-07-d25-27-atmospheric.nc"
+                "2025/2025-07-d28-30-atmospheric.nc"
+                "2025/2025-07-d31-31-atmospheric.nc"
+              )
+
+              IDX=$JOB_COMPLETION_INDEX
+              FILE="${FILES[$IDX]}"
+              SRC_FILE="/mnt/src/era5/$FILE"
+              DST_FILE="/mnt/dst/era5/$FILE"
+              LOCAL_IN="/scratch/input.nc"
+              LOCAL_OUT="/scratch/output.nc"
+
+              mkdir -p "$(dirname "$DST_FILE")"
+              mkdir -p /mnt/dst/logs
+              LOGFILE="/mnt/dst/logs/v4-$(echo "$FILE" | tr '/' '-').log"
+
+              echo "=== Pod index: $IDX ===" | tee "$LOGFILE"
+              echo "File: $FILE" | tee -a "$LOGFILE"
+              echo "Started: $(date)" | tee -a "$LOGFILE"
+              SRC_SIZE=$(stat -c%s "$SRC_FILE" 2>/dev/null || echo 0)
+              echo "Source size: $(( SRC_SIZE / 1048576 )) MB" | tee -a "$LOGFILE"
+
+              echo "" | tee -a "$LOGFILE"
+              echo "--- Step 1: CephFS -> local disk ---" | tee -a "$LOGFILE"
+              { time cp "$SRC_FILE" "$LOCAL_IN" ; } 2>&1 | tee -a "$LOGFILE"
+
+              echo "" | tee -a "$LOGFILE"
+              echo "--- Step 2: Python rechunk on local disk ---" | tee -a "$LOGFILE"
+              { time SRC="$LOCAL_IN" DST="$LOCAL_OUT" python3 /scripts/rechunk_era5.py ; } 2>&1 | tee -a "$LOGFILE"
+
+              echo "" | tee -a "$LOGFILE"
+              echo "--- Step 3: local disk -> CephFS ---" | tee -a "$LOGFILE"
+              rm -f "$DST_FILE"
+              { time cp "$LOCAL_OUT" "$DST_FILE" ; } 2>&1 | tee -a "$LOGFILE"
+
+              DST_SIZE=$(stat -c%s "$DST_FILE" 2>/dev/null || echo 0)
+              echo "Output size: $(( DST_SIZE / 1048576 )) MB" | tee -a "$LOGFILE"
+
+              rm -f "$LOCAL_IN" "$LOCAL_OUT"
+
+              echo "" | tee -a "$LOGFILE"
+              echo "Finished: $(date)" | tee -a "$LOGFILE"
+              echo "=== DONE ===" | tee -a "$LOGFILE"
+          volumeMounts:
+            - name: src
+              mountPath: /mnt/src
+              readOnly: true
+            - name: dst
+              mountPath: /mnt/dst
+            - name: scratch
+              mountPath: /scratch
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "1"
+              memory: "24Gi"
+              ephemeral-storage: "20Gi"
+            limits:
+              cpu: "1"
+              memory: "24Gi"
+              ephemeral-storage: "20Gi"
+      volumes:
+        - name: src
+          persistentVolumeClaim:
+            claimName: era5-summer-data-many-connect
+        - name: dst
+          persistentVolumeClaim:
+            claimName: era5-rechunked
+        - name: scratch
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: rechunk-era5-script

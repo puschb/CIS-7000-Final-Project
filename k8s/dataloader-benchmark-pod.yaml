@@ -1,0 +1,75 @@
+# Benchmark ERA5 data loading speed and memory.
+# CPU-only (no GPU). Tests single-sample timing and 8-worker DataLoader.
+#
+# Usage:
+#   kubectl create -f k8s/dataloader-benchmark-pod.yaml
+#   kubectl logs -f dataloader-bench
+#   kubectl delete pod dataloader-bench
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dataloader-bench
+spec:
+  initContainers:
+  - name: clone-repo
+    image: alpine/git
+    env:
+    - name: GIT_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: user
+    - name: GIT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: github-secret
+          key: password
+    args:
+    - clone
+    - --single-branch
+    - --depth=1
+    - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+    - /opt/repo
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+  containers:
+  - name: bench
+    image: puschb/aurora-dev:latest
+    command:
+    - sh
+    - -c
+    - |
+      cd /opt/repo
+      export PYTHONPATH=/opt/repo
+      python -u scripts/benchmark_dataloader.py \
+        --data-dir /mnt/data/era5/2024 /mnt/data/era5/2025 \
+        --rollout-steps 1 \
+        --workers 8 \
+        --batch-sizes 1 2 4 8 \
+        --n-batches 6
+    volumeMounts:
+    - name: repo
+      mountPath: /opt/repo
+    - name: data
+      mountPath: /mnt/data
+    - name: dshm
+      mountPath: /dev/shm
+    resources:
+      requests:
+        memory: 16Gi
+        cpu: "10"
+      limits:
+        memory: 16Gi
+        cpu: "10"
+  volumes:
+  - name: repo
+    emptyDir: {}
+  - name: data
+    persistentVolumeClaim:
+      claimName: era5-rechunked
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 10Gi
+  restartPolicy: Never

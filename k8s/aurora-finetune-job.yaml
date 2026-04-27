@@ -1,4 +1,4 @@
-# Fine-tuning job: clones repo, runs src/finetune.py on A100 80GB.
+# Fine-tuning job: clones repo, runs src/finetune.py on L40 48GB.
 #
 # Usage:
 #   kubectl create -f k8s/aurora-finetune-job.yaml
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-L40
       initContainers:
       - name: clone-repo
         image: alpine/git
@@ -71,16 +71,21 @@ spec:
         volumeMounts:
         - name: repo
           mountPath: /opt/repo
+        - name: data
+          mountPath: /mnt/data
         resources:
           requests:
-            memory: 32Gi
+            memory: 48Gi
             cpu: "4"
-            nvidia.com/a100: "1"
+            nvidia.com/gpu: "1"
           limits:
-            memory: 32Gi
+            memory: 48Gi
             cpu: "4"
-            nvidia.com/a100: "1"
+            nvidia.com/gpu: "1"
       volumes:
       - name: repo
         emptyDir: {}
+      - name: data
+        persistentVolumeClaim:
+          claimName: era5-rechunked
       restartPolicy: Never

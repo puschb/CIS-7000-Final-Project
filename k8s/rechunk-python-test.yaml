@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rechunk-python-test
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.kubernetes.io/region
+            operator: In
+            values:
+            - us-west
+  containers:
+    - name: rechunk
+      image: python:3.11-slim
+      command:
+        - bash
+        - -c
+        - |
+          set -e
+          pip install -q xarray netcdf4 numpy
+
+          FILE="2025/2025-06-d16-18-atmospheric.nc"
+          SRC="/mnt/src/era5/$FILE"
+
+          echo "=== Copy source to local disk ==="
+          mkdir -p /scratch
+          SRC_SIZE=$(stat -c%s "$SRC" 2>/dev/null || echo 0)
+          echo "Source: $SRC ($(( SRC_SIZE / 1048576 )) MB)"
+          echo "Start copy: $(date)"
+          time cp "$SRC" /scratch/input.nc
+          echo "End copy: $(date)"
+          echo ""
+
+          echo "=== Run Python rechunk ==="
+          python3 /mnt/script/test_rechunk_python.py
+          echo ""
+
+          echo "=== Copy result back to CephFS ==="
+          DST="/mnt/dst/era5/$FILE"
+          mkdir -p "$(dirname "$DST")"
+          echo "Start copy back: $(date)"
+          time cp /scratch/output.nc "$DST"
+          echo "End copy back: $(date)"
+
+          DST_SIZE=$(stat -c%s "$DST" 2>/dev/null || echo 0)
+          echo "Final size: $(( DST_SIZE / 1048576 )) MB"
+          echo ""
+          echo "=== ALL DONE ==="
+      volumeMounts:
+        - name: src
+          mountPath: /mnt/src
+          readOnly: true
+        - name: dst
+          mountPath: /mnt/dst
+        - name: scratch
+          mountPath: /scratch
+        - name: script
+          mountPath: /mnt/script
+      resources:
+        requests:
+          cpu: "1"
+          memory: "24Gi"
+          ephemeral-storage: "20Gi"
+        limits:
+          cpu: "1"
+          memory: "24Gi"
+          ephemeral-storage: "20Gi"
+  volumes:
+    - name: src
+      persistentVolumeClaim:
+        claimName: era5-summer-data-many-connect
+    - name: dst
+      persistentVolumeClaim:
+        claimName: era5-rechunked
+    - name: scratch
+      emptyDir: {}
+    - name: script
+      configMap:
+        name: rechunk-python-script

@@ -24,7 +24,9 @@ def main():
     print()
 
     print("Loading sample 0 ...")
-    inp, tgt = ds[0]
+    inp, targets = ds[0]
+    tgt = targets[0]
+    print(f"Rollout steps: {len(targets)} target(s)")
     print(f"Input surf_vars keys: {list(inp.surf_vars.keys())}")
     print(f"Input atmos_vars keys: {list(inp.atmos_vars.keys())}")
     print(f"Static vars keys: {list(inp.static_vars.keys())}")
@@ -38,8 +40,9 @@ def main():
     print(f"Lon shape: {inp.metadata.lon.shape}, range: [{inp.metadata.lon[0]:.2f}, {inp.metadata.lon[-1]:.2f}]")
     print()
 
-    print(f"Target 2t shape: {tgt.surf_vars['2t'].shape}")
-    print(f"Target metadata time: {tgt.metadata.time}")
+    for ti, tgt in enumerate(targets):
+        print(f"Target {ti} 2t shape: {tgt.surf_vars['2t'].shape}")
+        print(f"Target {ti} metadata time: {tgt.metadata.time}")
     print()
 
     # NaN check
@@ -52,12 +55,21 @@ def main():
         if torch.isnan(v).any():
             print(f"WARNING: NaN in input atmos_vars[{k}]")
             nan_found = True
-    for k, v in tgt.surf_vars.items():
-        if torch.isnan(v).any():
-            print(f"WARNING: NaN in target surf_vars[{k}]")
-            nan_found = True
+    for ti, tgt in enumerate(targets):
+        for k, v in tgt.surf_vars.items():
+            if torch.isnan(v).any():
+                print(f"WARNING: NaN in target[{ti}] surf_vars[{k}]")
+                nan_found = True
     if not nan_found:
         print("No NaNs detected in sample 0")
+    print()
+
+    # Density channel checks
+    if "swvl1_density" in inp.surf_vars:
+        dens = inp.surf_vars["swvl1_density"]
+        print(f"swvl1_density unique values: {torch.unique(dens).tolist()}")
+        land_frac = dens.mean().item()
+        print(f"swvl1_density land fraction: {land_frac:.3f}")
     print()
 
     # Value sanity checks
@@ -73,7 +85,8 @@ def main():
     # Load a sample from the middle
     mid = len(ds) // 2
     print(f"Loading sample {mid} (middle) ...")
-    inp2, tgt2 = ds[mid]
+    inp2, targets2 = ds[mid]
+    tgt2 = targets2[0]
     print(f"Sample {mid} input time: {inp2.metadata.time}, target time: {tgt2.metadata.time}")
     print(f"2t shape: {inp2.surf_vars['2t'].shape}")
     print()
