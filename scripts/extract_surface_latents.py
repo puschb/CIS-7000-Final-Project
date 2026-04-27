@@ -416,7 +416,8 @@ def main():
                 if args.max_samples_per_split is not None and split_counts[spec.split] >= args.max_samples_per_split:
                     break
 
-                input_batch, target_batch = dataset[idx]
+                input_batch, targets = dataset[idx]
+                target_batch = targets[0]
                 for forbidden in target_vars:
                     assert forbidden not in input_batch.surf_vars, f"{forbidden} leaked into inputs"
 

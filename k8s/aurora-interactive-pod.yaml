@@ -1,9 +1,7 @@
-# GPU interactive pod (A100 80GB) for development.
+# GPU interactive pod (L40 48GB) for development.
 # Clones repo at startup, drops you into a shell with everything ready.
 #
 # Usage:
-#   bash scripts/k8s-interactive-gpu.sh
-#   # or manually:
 #   kubectl create -f k8s/aurora-interactive-pod.yaml
 #   kubectl exec -it aurora-dev -- /bin/bash
 #   kubectl delete pod aurora-dev
@@ -20,7 +18,7 @@ spec:
           - key: nvidia.com/gpu.product
             operator: In
             values:
-            - NVIDIA-A100-SXM4-80GB
+            - NVIDIA-L40
   initContainers:
   - name: clone-repo
     image: alpine/git
@@ -62,16 +60,21 @@ spec:
     volumeMounts:
     - name: repo
       mountPath: /opt/repo
+    - name: data
+      mountPath: /mnt/data
     resources:
       requests:
         memory: 32Gi
         cpu: "4"
-        nvidia.com/a100: "1"
+        nvidia.com/gpu: "1"
       limits:
         memory: 32Gi
         cpu: "4"
-        nvidia.com/a100: "1"
+        nvidia.com/gpu: "1"
   volumes:
   - name: repo
     emptyDir: {}
+  - name: data
+    persistentVolumeClaim:
+      claimName: era5-rechunked
   restartPolicy: Never

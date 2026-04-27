@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rechunk-nvme-test
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.kubernetes.io/region
+            operator: In
+            values:
+            - us-west
+  containers:
+    - name: rechunk
+      image: debian:bookworm-slim
+      command:
+        - bash
+        - -c
+        - |
+          set -e
+          apt-get update -qq && apt-get install -y -qq netcdf-bin >/dev/null 2>&1
+          echo "nccopy installed"
+          echo ""
+
+          FILE="2025/2025-06-d13-15-atmospheric.nc"
+          SRC="/mnt/src/era5/$FILE"
+          LOCAL="/scratch/input.nc"
+          LOCAL_OUT="/scratch/output.nc"
+          DST="/mnt/dst/era5/$FILE"
+
+          mkdir -p /scratch
+          mkdir -p "$(dirname "$DST")"
+
+          echo "=== Step 1: Copy source from CephFS to local disk ==="
+          echo "Source: $SRC"
+          SRC_SIZE=$(stat -c%s "$SRC" 2>/dev/null || echo 0)
+          echo "Source size: $(( SRC_SIZE / 1048576 )) MB"
+          echo "Start: $(date)"
+          { time cp "$SRC" "$LOCAL" ; } 2>&1
+          echo "End: $(date)"
+          echo ""
+
+          echo "=== Step 2: Rechunk locally with nccopy ==="
+          echo "Start: $(date)"
+          { time nccopy -c valid_time/1,pressure_level/13,latitude/721,longitude/1440 "$LOCAL" "$LOCAL_OUT" ; } 2>&1
+          echo "End: $(date)"
+          LOCAL_OUT_SIZE=$(stat -c%s "$LOCAL_OUT" 2>/dev/null || echo 0)
+          echo "Output size: $(( LOCAL_OUT_SIZE / 1048576 )) MB"
+          echo ""
+
+          echo "=== Step 3: Copy rechunked file back to CephFS ==="
+          echo "Start: $(date)"
+          { time cp "$LOCAL_OUT" "$DST" ; } 2>&1
+          echo "End: $(date)"
+          echo ""
+
+          rm -f "$LOCAL" "$LOCAL_OUT"
+
+          echo "=== DONE ==="
+      volumeMounts:
+        - name: src
+          mountPath: /mnt/src
+          readOnly: true
+        - name: dst
+          mountPath: /mnt/dst
+        - name: scratch
+          mountPath: /scratch
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+          ephemeral-storage: "20Gi"
+        limits:
+          cpu: "2"
+          memory: "8Gi"
+          ephemeral-storage: "20Gi"
+  volumes:
+    - name: src
+      persistentVolumeClaim:
+        claimName: era5-summer-data-many-connect
+    - name: dst
+      persistentVolumeClaim:
+        claimName: era5-rechunked
+    - name: scratch
+      emptyDir: {}

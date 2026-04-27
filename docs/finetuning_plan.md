@@ -15,15 +15,15 @@ We use the small model because we have ~48 GB GPU memory (not 80 GB A100s), and 
 compute budget. The small model at 0.25° resolution fits comfortably in 48 GB even with
 multi-step rollouts.
 
-**Training data:** ERA5 0.25° resolution, June–August 2024 and 2025 (summer only).
+**Training data:** ERA5 0.25° resolution, June–July 2024 and 2025 (summer only).
 
 **Train/val/test split:**
 
-| Split | Date Range | Days | % |
+| Split | Date Range | Days | Approx. samples |
 |---|---|---|---|
-| Train | Jun 1 – Aug 1 2024 + Jun 1 – Aug 1 2025 | ~122 | 66% |
-| Val | Aug 1 – Aug 16 2024 + Aug 1 – Aug 16 2025 | ~30 | 17% |
-| Test | Aug 16 – Sep 1 2024 + Aug 16 – Sep 1 2025 | ~32 | 17% |
+| Train | Jun 1 – Jul 1 2024 + Jun 1 – Jul 1 2025 | 60 | ~1,400 |
+| Val | Jul 1 – Jul 16 2024 + Jul 1 – Jul 16 2025 | 30 | ~700 |
+| Test | Jul 16 – Aug 1 2024 + Jul 16 – Aug 1 2025 | 30 | ~700 |
 
 ---
 
@@ -46,8 +46,8 @@ The paper describes four fine-tuning tasks. Here's how they compare to our scena
 
 **One difference**: our base LR is 5e-5 (from HRES 0.25° T0) rather than 3e-4 (from WAM).
 The WAM task uses a higher base LR because it fine-tunes with a cosine schedule over 30k
-steps on a much larger dataset (6 years of data). With our small dataset (~4 months),
-we need a lower base LR to avoid overshooting.
+steps on a much larger dataset (6 years of data). With our small dataset (~2 months
+training), we need a lower base LR to avoid overshooting.
 
 ---
 
@@ -200,18 +200,27 @@ The new embeddings start from zero and need to learn from scratch, so they need 
 higher learning rate. The pretrained backbone already has good representations and only
 needs gentle adaptation.
 
-### Training loop: 1-step vs 2-step rollout
+### Training loop: configurable rollout steps
 
-**1-step (recommended to start):**
+The dataset supports configurable `rollout_steps` (see `docs/data_pipeline.md`):
+
+**`rollout_steps=1` (recommended to start):**
 ```
+DataLoader returns: (input_batch, [target_6h])
 input: (t-6h, t) → model → prediction at t+6h → MAE loss vs ground truth at t+6h
 ```
 
-**2-step (if memory allows):**
+**`rollout_steps=2` (if memory allows):**
 ```
-input: (t-6h, t) → model → pred at t+6h → assemble new input → model → pred at t+12h
-loss = average(MAE at t+6h, MAE at t+12h)
+DataLoader returns: (input_batch, [target_6h, target_12h])
+input: (t-6h, t) → model → pred at t+6h → MAE loss vs target_6h
+                  → assemble new input → model → pred at t+12h → MAE loss vs target_12h
+total loss = average(MAE at t+6h, MAE at t+12h)
 ```
+
+With `rollout_steps=2`, each sample loads 4 timesteps (t-6h, t, t+6h, t+12h) instead
+of 3, increasing per-sample size from ~900 MB to ~1.2 GB and requiring more DataLoader
+workers and shared memory (see `docs/data_pipeline.md` for details).
 
 With AuroraSmall on a 48 GB GPU, 2-step rollout should fit. The full 1.3B model required
 8 GPUs with gradient sharding to fit 2 steps on A100-80GB, but our model is ~10x smaller.
@@ -221,9 +230,9 @@ With AuroraSmall on a 48 GB GPU, 2-step rollout should fit. The full 1.3B model 
 | Parameter | Value | What it controls | Why this value |
 |---|---|---|---|
 | **Model** | `AuroraSmallPretrained` | Architecture size (~113M params, embed_dim=256) | Fits in 48 GB GPU; we lack compute for the 1.3B model |
-| **Rollout steps** | 2 (try 1 if OOM) | Number of autoregressive forward passes during training, backprop through all | Paper uses 2 for HRES 0.25° (D.3). Small model should fit. |
+| **Rollout steps** | 1 or 2 (configurable) | Number of autoregressive forward passes during training, backprop through all | Paper uses 2 for HRES 0.25° (D.3). Start with 1; try 2 if it fits. See `docs/data_pipeline.md`. |
 | **Batch size** | 1 | Samples per GPU per step | Always 1 for Aurora at 0.25° resolution — the full grid is huge |
-| **Total training steps** | 3,000 | How long to train | We have ~488 triplets in training set (122 days × 4 per day at 6h). 3k steps ≈ 6 epochs. Paper uses 8k–14k but with orders of magnitude more data. |
+| **Total training steps** | 3,000 | How long to train | We have ~1,400 samples in training set (60 days × ~23 hourly t1 values per day). 3k steps ≈ 2 epochs. Paper uses 8k–14k but with orders of magnitude more data. |
 | **LR (pretrained params)** | 5e-5 | Learning rate for all existing pretrained weights | Matches HRES 0.25° fine-tuning (D.3). Low because these weights are already good. |
 | **LR (new embeddings)** | 1e-3 | Learning rate for swvl1/stl1/sd and their density channel patch embeddings | Matches CAMS/wave pattern (D.3). High because these start from zero. |
 | **LR warmup** | 500 steps | Linearly ramp LR from 0 to target over this many steps | Matches wave fine-tuning (D.3). Prevents early instability when loss landscape is unexplored. |
@@ -361,22 +370,24 @@ for name, param in model.named_parameters():
 ### The replay buffer algorithm
 
 ```
-1. Initialize buffer with N samples from the training dataset (initial conditions)
-   Each entry stores: (input_batch, ground_truth_timestamp, lead_time_steps=0)
+1. Initialize buffer with 30 samples from the training dataset (initial conditions)
+   Each entry stores: (input_batch, ground_truth_at_next_step, lead_time_steps=0)
+   Ground truth is stored alongside the input to avoid slow CephFS reads during training.
 
 2. For each training step:
    a. Sample one entry from the buffer
    b. Forward the model ONE step (with gradients)
-   c. Compute MAE loss against ground truth at the predicted timestamp
+   c. Compute MAE loss against the stored ground truth
    d. Backprop + optimizer step
    e. Detach the prediction and add it back to the buffer with lead_time += 1
-   f. If lead_time exceeds max_lead_time, discard the entry
-   g. Every `dataset_sampling_period` steps, replace some entries with fresh
+   f. Fetch the next ground truth from disk in a background thread
+   g. If lead_time exceeds max_lead_time, discard the entry
+   h. Every `dataset_sampling_period` steps, replace some entries with fresh
       initial conditions from the dataset
 
 3. Lead time schedule:
-   - First 2k steps: only keep entries with lead time ≤ 4 days (16 steps)
-   - After 2k steps: allow lead times up to 10 days (40 steps)
+   - First 1k steps: only keep entries with lead time ≤ 1.5 days (6 steps)
+   - After 1k steps: allow lead times up to 3 days (12 steps)
 ```
 
 The detaching is the pushforward trick — by detaching the prediction before storing it
@@ -390,11 +401,11 @@ flow through that single forward pass.
 | **LoRA** | `use_lora=True` | Injects low-rank adaptation matrices into all self-attention linear layers in the Swin3D backbone | Paper's approach for rollout fine-tuning (D.4). Enables parameter-efficient adaptation. |
 | **LoRA rank** | Library default | Rank of the low-rank matrices A, B. Lower = fewer params, less capacity. | Use library default; can increase if underfitting. |
 | **Frozen params** | Everything except LoRA | Which parameters receive gradients | Only LoRA layers train during rollout (D.4). Base model is fixed. |
-| **Buffer size (per GPU)** | 100 | Number of (batch, lead_time) entries in CPU memory per GPU | Paper uses 100–200 per GPU (D.4). Each entry ≈ 300 MB at 0.25° (all vars × 721 × 1440 × float32). 100 entries ≈ 30 GB CPU RAM. |
+| **Buffer size (per GPU)** | 30 | Number of (input, ground_truth, lead_time) entries in CPU memory per GPU | Paper uses 100–200 per GPU (D.4). We use 30 to fit in 48 GB CPU RAM (each entry ≈ 900 MB including ground truth). With ~1,400 training samples, 30 entries covers ~2% — sufficient diversity for our small dataset. |
 | **Dataset sampling period** | 10 | Every N steps, replace some buffer entries with fresh initial conditions from the dataset | Paper value (D.4). Balances exploration of new initial conditions vs. extending existing rollouts. |
-| **Max lead time (early)** | 4 days (first 2k steps) | Maximum forecast horizon in the buffer during early training | Paper uses this curriculum for HRES 0.25° (D.4). Learn short-range dynamics before attempting long-range. |
-| **Max lead time (late)** | 10 days (after 2k steps) | Maximum forecast horizon in the buffer during later training | Paper's HRES 0.25° protocol (D.4). 10 days is the typical medium-range forecast horizon. |
-| **Total steps** | 4,000 | Training duration | Paper uses 6k–13k with far more data. Scale down proportionally for our ~122 training days. |
+| **Max lead time (early)** | 1.5 days / 6 steps (first 1k steps) | Maximum forecast horizon in the buffer during early training | Scaled down from paper's 4 days. Learn short-range stability first. |
+| **Max lead time (late)** | 3 days / 12 steps (after 1k steps) | Maximum forecast horizon in the buffer during later training | Our target horizon. Paper uses 10 days with far more data. |
+| **Total steps** | 3,000 | Training duration | Paper uses 6k–13k with far more data. Scale down proportionally for our ~60 training days. |
 | **LR** | 5e-5, constant | Learning rate for LoRA parameters | Paper uses this for all rollout tasks (D.4). No schedule needed — LoRA layers are small and start from zero. |
 | **Optimizer** | AdamW | Same as Stage 1 | Consistency with paper. |
 | **Weight decay** | 0 | No regularization on LoRA weights | LoRA matrices are small; weight decay can hurt their expressivity. |
@@ -452,9 +463,12 @@ uses these global dictionaries to normalize inputs and unnormalize outputs.
 - **48 GB GPU** with AuroraSmall at 0.25° should be comfortable for single-step, and
   likely fine for 2-step rollout with activation checkpointing. If you hit OOM on
   2-step, fall back to 1-step.
-- **CPU memory** for the replay buffer: 100 entries × ~300 MB = ~30 GB. Make sure your
-  k8s job requests enough CPU memory (at least 48 GB to be safe).
+- **CPU memory for Stage 1:** ~32 GB RAM (27 GB val cache + overhead) + 8–12 GB shared
+  memory for DataLoader workers. Request 48 GB total.
+- **CPU memory for Stage 2:** ~43 GB RAM (27 GB replay buffer including ground truth +
+  12.6 GB rollout val cache + overhead) + 2 GB shared memory. Request 48 GB total.
 - **Activation checkpointing** is critical. Without it, even single-step training can OOM.
+- See `docs/data_pipeline.md` for detailed memory budgets for each configuration.
 
 ### Loss dynamics
 
@@ -483,21 +497,23 @@ uses these global dictionaries to normalize inputs and unnormalize outputs.
 
 ### Data loading and density channels
 
-- The dataloader must create density channels on the fly: for each soil variable,
+- The dataloader creates density channels on the fly: for each soil variable,
   add a `{name}_density` tensor that is 1 where not NaN, 0 where NaN, then replace
-  NaN with 0 in the data variable. This happens in the dataloader, before the batch
-  is passed to the model (the model's normalisation will handle the rest).
-- The dataloader currently returns triplets (t-6h, t, t+6h). This works for Stage 1.
-- For Stage 2's replay buffer, you also need to look up arbitrary ground-truth timestamps
-  to compute loss at any lead time. The current dataset can be queried for this, but the
-  replay buffer itself manages the autoregressive chain.
+  NaN with 0 in the data variable. This happens in the worker process before the batch
+  enters shared memory.
+- The dataloader returns `(input_batch, targets)` where `targets` is a list of 1 or 2
+  `Batch` objects depending on `rollout_steps`. See `docs/data_pipeline.md`.
+- For Stage 2's replay buffer, each entry stores its next-step ground truth alongside
+  the input pair. New ground truth is fetched via a background thread after each step.
+  The dataset's `load_timestep()` method supports arbitrary single-timestamp lookups.
 - During autoregressive rollout, the model's own density predictions feed back as input.
   Following the wave pattern: threshold predicted density at 0.5 — set density to 1
   where > 0.5, and set both density and data to 0 where < 0.5. This prevents
   distribution mismatch between training inputs (binary 0/1) and model predictions
   (continuous sigmoid output).
-- With `num_workers > 0` in the DataLoader, data loading should not be a bottleneck
-  even with the current NetCDF chunking.
+- CephFS reads are slow (~36s per timestep). Stage 1 uses 8–10 DataLoader workers to
+  hide I/O behind GPU compute. Stage 2 uses background threads for ground truth
+  prefetching. See `docs/data_pipeline.md` for full details.
 
 ### Multi-GPU (if available)
 
@@ -514,14 +530,18 @@ uses these global dictionaries to normalize inputs and unnormalize outputs.
 src/
   finetune_short.py     # Stage 1: short-lead-time fine-tuning
   finetune_rollout.py   # Stage 2: rollout fine-tuning with LoRA + replay buffer
-  data.py               # Dataset and data loading
+  data.py               # Dataset and data loading (ERA5Dataset, MultiRangeERA5Dataset)
   finetune.py           # Current prototype (to be replaced by the above)
 k8s/
-  aurora-finetune-job.yaml  # K8s job for running training
+  aurora-finetune-stage1-job.yaml  # K8s job for Stage 1
+  aurora-finetune-stage2-job.yaml  # K8s job for Stage 2
+  aurora-interactive-pod.yaml      # Interactive GPU pod for development
 scripts/
   compute_norm_stats.py     # Compute normalization statistics
 docs/
-  finetuning_plan.md        # This document
+  finetuning_plan.md        # This document (architecture & hyperparameters)
+  data_pipeline.md          # Data loading, caching, validation strategy, and I/O details
+  data_selection.md         # Variable selection rationale
   preprocessing_and_splits.md  # Data preprocessing and split details
 ```
 
@@ -534,7 +554,7 @@ docs/
 | Hyperparameter | Value |
 |---|---|
 | Model | AuroraSmallPretrained (~113M params) |
-| Rollout steps | 2 (1 if OOM) |
+| Rollout steps | 1 or 2 (configurable) |
 | Batch size | 1 |
 | Training steps | 3,000 |
 | LR (pretrained) | 5e-5 |
@@ -558,11 +578,11 @@ docs/
 | Model | AuroraSmallPretrained + LoRA |
 | LoRA | All self-attention linears |
 | Trainable params | LoRA only |
-| Buffer size / GPU | 100 |
+| Buffer size / GPU | 30 |
 | Dataset sampling period | 10 |
-| Max lead time (early) | 4 days (steps 0–2k) |
-| Max lead time (late) | 10 days (steps 2k+) |
-| Training steps | 4,000 |
+| Max lead time (early) | 1.5 days (steps 0–1k) |
+| Max lead time (late) | 3 days (steps 1k+) |
+| Training steps | 3,000 |
 | LR | 5e-5 (constant) |
 | Optimizer | AdamW |
 | Weight decay | 0 |

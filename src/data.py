@@ -24,6 +24,15 @@ PRESSURE_LEVELS = (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 10
 FULL_RES_LAT = 721   # 0.25 degree: 90 to -90
 FULL_RES_LON = 1440  # 0.25 degree: 0 to 359.75
 
+DENSITY_VARS = ("swvl1", "stl1", "sd")
+
+SOIL_SURF_VARS = (
+    "2t", "10u", "10v", "msl",
+    "swvl1", "swvl1_density",
+    "stl1", "stl1_density",
+    "sd", "sd_density",
+)
+
 # ERA5 NetCDF short names -> Aurora names
 SURF_ERA5_TO_AURORA = {
     "t2m": "2t",
@@ -32,8 +41,6 @@ SURF_ERA5_TO_AURORA = {
     "msl": "msl",
 }
 
-# Extra surface vars we downloaded that aren't in the standard Aurora model.
-# These get added when extending Aurora with new variables.
 EXTRA_SURF_ERA5_TO_AURORA = {
     "swvl1": "swvl1",
     "stl1": "stl1",
@@ -53,6 +60,26 @@ ATMOS_ERA5_TO_AURORA = {
     "q": "q",
     "z": "z",
 }
+
+
+# ---------------------------------------------------------------------------
+# Density channel helper
+# ---------------------------------------------------------------------------
+
+def _add_density_channels(surf_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Create density channels for soil variables and replace NaN with 0.
+
+    For each variable in DENSITY_VARS that exists in surf_dict, adds a
+    companion ``{var}_density`` tensor (1 where data present, 0 where NaN)
+    and replaces NaN values in the data with 0.
+    """
+    for var in DENSITY_VARS:
+        if var in surf_dict:
+            data = surf_dict[var]
+            surf_dict[f"{var}_density"] = (~torch.isnan(data)).float()
+            surf_dict[var] = data.nan_to_num(0.0)
+    return surf_dict
+
 
 # ---------------------------------------------------------------------------
 # File index helpers
@@ -101,26 +128,96 @@ def _surface_time_index(dt: datetime) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Multi-worker safety
+# ---------------------------------------------------------------------------
+
+def collate_era5_batch(
+    samples: list[tuple[Batch, list[Batch]]],
+) -> tuple[Batch, list[Batch]]:
+    """Collate a list of (input_batch, targets) samples into a single batched pair.
+
+    PyTorch's default collator doesn't know how to handle Aurora's Batch dataclass
+    (it contains dicts of tensors and non-tensor metadata like datetime tuples).
+    This function handles the collation manually:
+
+    - surf_vars / atmos_vars: concatenated along the batch dim (dim 0)
+    - static_vars: taken from the first sample (identical across samples)
+    - metadata.time: tuples are concatenated → one datetime per sample
+    - metadata.lat / lon / atmos_levels / rollout_step: taken from first sample
+    """
+    inputs = [s[0] for s in samples]
+    target_lists = [s[1] for s in samples]
+
+    def cat_batch(batches: list[Batch]) -> Batch:
+        return Batch(
+            surf_vars={
+                k: torch.cat([b.surf_vars[k] for b in batches], dim=0)
+                for k in batches[0].surf_vars
+            },
+            static_vars=batches[0].static_vars,
+            atmos_vars={
+                k: torch.cat([b.atmos_vars[k] for b in batches], dim=0)
+                for k in batches[0].atmos_vars
+            },
+            metadata=Metadata(
+                lat=batches[0].metadata.lat,
+                lon=batches[0].metadata.lon,
+                time=sum((b.metadata.time for b in batches), ()),
+                atmos_levels=batches[0].metadata.atmos_levels,
+                rollout_step=batches[0].metadata.rollout_step,
+            ),
+        )
+
+    collated_input = cat_batch(inputs)
+
+    n_targets = len(target_lists[0])
+    collated_targets = [
+        cat_batch([target_lists[i][step] for i in range(len(samples))])
+        for step in range(n_targets)
+    ]
+
+    return collated_input, collated_targets
+
+
+def era5_worker_init_fn(worker_id: int) -> None:
+    """Clear xarray file handle caches after fork.
+
+    Pass this to ``DataLoader(worker_init_fn=...)`` when using
+    ``num_workers > 0``. Each forked worker needs its own file handles.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    dataset = info.dataset
+    targets = dataset.datasets if hasattr(dataset, "datasets") else [dataset]
+    for ds in targets:
+        ds._ds_cache.clear()
+
+
+# ---------------------------------------------------------------------------
 # ERA5Dataset
 # ---------------------------------------------------------------------------
 
 class ERA5Dataset(Dataset):
-    """PyTorch Dataset that serves Aurora-compatible (input, target) Batch pairs
-    from ERA5 NetCDF files produced by scripts/download_era5.py.
+    """PyTorch Dataset that serves Aurora-compatible samples from ERA5 NetCDF
+    files produced by ``scripts/download_era5.py``.
 
-    Each sample is a triplet of timestamps (t-6h, t, t+6h):
-      - input batch: history dim with t-6h and t
-      - target batch: ground truth at t+6h
+    Each sample is a sequence of timestamps whose length depends on
+    ``rollout_steps``:
+
+    - ``rollout_steps=1``: triplet ``(t-6h, t, t+6h)`` — 1 target
+    - ``rollout_steps=2``: quadruplet ``(t-6h, t, t+6h, t+12h)`` — 2 targets
+
+    ``__getitem__`` returns ``(input_batch, targets)`` where *targets* is a
+    **list** of Aurora ``Batch`` objects (length == ``rollout_steps``).
 
     Args:
         data_dirs: One or more directories containing downloaded ERA5 data.
-            Each should have static.nc, monthly surface files, and atmospheric
-            chunk files. Typically one dir per year.
-        start_date: Inclusive start of the date range (filters triplets).
-        end_date: Exclusive end of the date range (filters triplets).
-        step_hours: Time gap between consecutive steps (default 6h for Aurora).
-        include_extra_surf: If True, include soil moisture / soil temp / snow
-            depth in surf_vars (for extending Aurora with new variables).
+        start_date: Inclusive start of the date range (filters on ``t``).
+        end_date: Exclusive end of the date range (filters on ``t``).
+        step_hours: Time gap between consecutive steps (default 6h).
+        include_extra_surf: Include soil/snow variables and density channels.
+        rollout_steps: Number of target timesteps (1 or 2).
     """
 
     def __init__(
@@ -130,38 +227,18 @@ class ERA5Dataset(Dataset):
         end_date: datetime | None = None,
         step_hours: int = 6,
         include_extra_surf: bool = True,
-        input_surf_vars: tuple[str, ...] | list[str] | None = None,
-        target_surf_vars: tuple[str, ...] | list[str] | None = None,
+        rollout_steps: int = 1,
     ):
         if isinstance(data_dirs, (str, Path)):
             data_dirs = [data_dirs]
         self.data_dirs = [Path(d) for d in data_dirs]
         self.step_hours = step_hours
         self.include_extra_surf = include_extra_surf
-
-        available_surf_vars = set(BASE_SURF_VAR_NAMES)
-        if include_extra_surf:
-            available_surf_vars.update(EXTRA_SURF_VAR_NAMES)
-
-        if input_surf_vars is None:
-            input_surf_vars = SURF_VAR_NAMES if include_extra_surf else BASE_SURF_VAR_NAMES
-        if target_surf_vars is None:
-            target_surf_vars = input_surf_vars
-
-        self.input_surf_vars = tuple(input_surf_vars)
-        self.target_surf_vars = tuple(target_surf_vars)
-
-        unknown_input = set(self.input_surf_vars) - available_surf_vars
-        unknown_target = set(self.target_surf_vars) - available_surf_vars
-        if unknown_input or unknown_target:
-            raise ValueError(
-                "Requested unavailable surface vars. "
-                f"input={sorted(unknown_input)} target={sorted(unknown_target)} "
-                f"available={sorted(available_surf_vars)}"
-            )
+        self.rollout_steps = rollout_steps
 
         self.surf_map = SURF_ERA5_TO_AURORA.copy()
-        self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
+        if include_extra_surf:
+            self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
 
         # Build file indices across all data directories
         self.surface_files: dict[tuple[int, int], Path] = {}
@@ -190,59 +267,65 @@ class ERA5Dataset(Dataset):
         self.lon = torch.from_numpy(static_ds.longitude.values).float()
         static_ds.close()
 
-        # Cache for open xarray Dataset handles to avoid re-opening multi-GB
-        # files on every __getitem__ call.  Keys are file paths.
         self._ds_cache: dict[Path, xr.Dataset] = {}
 
-        # Build list of valid triplets
-        self.triplets = self._build_triplets(start_date, end_date)
+        self.sequences = self._build_sequences(start_date, end_date)
 
-    def _build_triplets(
+    # Keep backward-compat alias
+    @property
+    def triplets(self) -> list[tuple[datetime, ...]]:
+        return self.sequences
+
+    def _build_sequences(
         self,
         start_date: datetime | None,
         end_date: datetime | None,
-    ) -> list[tuple[datetime, datetime, datetime]]:
-        """Enumerate all valid (t-step, t, t+step) triplets within the date range."""
-        step = timedelta(hours=self.step_hours)
-        triplets = []
+    ) -> list[tuple[datetime, ...]]:
+        """Build valid timestamp sequences of length ``2 + rollout_steps``.
 
-        for (year, month), surf_path in sorted(self.surface_files.items()):
+        ``rollout_steps=1`` → ``(t-6h, t, t+6h)``
+        ``rollout_steps=2`` → ``(t-6h, t, t+6h, t+12h)``
+        """
+        step = timedelta(hours=self.step_hours)
+        sequences: list[tuple[datetime, ...]] = []
+
+        for (year, month), _surf_path in sorted(self.surface_files.items()):
             n_days = calendar.monthrange(year, month)[1]
             month_start = datetime(year, month, 1, 0, 0)
             month_end = datetime(year, month, n_days, 23, 0)
 
-            # Iterate every hour in this month as the "current" time t1
-            t1 = month_start + step  # earliest t1 so that t0 = t1-step is in range
-            while t1 + step <= month_end:
+            t1 = month_start + step
+            while True:
                 t0 = t1 - step
-                t2 = t1 + step
+                targets = [t1 + step * i for i in range(1, self.rollout_steps + 1)]
+                last_ts = targets[-1]
 
-                # Apply date range filter (on t1, the "current" time)
+                if last_ts > month_end:
+                    break
+
                 if start_date and t1 < start_date:
                     t1 += timedelta(hours=1)
                     continue
                 if end_date and t1 >= end_date:
                     break
 
-                # Check that all 3 timestamps are in the same month (surface file)
-                if t0.month != month or t2.month != month:
+                timestamps = [t0, t1] + targets
+                if any(ts.month != month for ts in timestamps):
                     t1 += timedelta(hours=1)
                     continue
 
-                # Check atmospheric file coverage for all 3 timestamps
-                if (
-                    _find_atmos_file(t0, self.atmos_chunks) is not None
-                    and _find_atmos_file(t1, self.atmos_chunks) is not None
-                    and _find_atmos_file(t2, self.atmos_chunks) is not None
+                if all(
+                    _find_atmos_file(ts, self.atmos_chunks) is not None
+                    for ts in timestamps
                 ):
-                    triplets.append((t0, t1, t2))
+                    sequences.append(tuple(timestamps))
 
                 t1 += timedelta(hours=1)
 
-        return triplets
+        return sequences
 
     def __len__(self) -> int:
-        return len(self.triplets)
+        return len(self.sequences)
 
     def _open_ds(self, path: Path) -> xr.Dataset:
         """Return a cached xarray Dataset handle, opening the file only once."""
@@ -250,40 +333,46 @@ class ERA5Dataset(Dataset):
             self._ds_cache[path] = xr.open_dataset(path, engine="netcdf4")
         return self._ds_cache[path]
 
-    def _load_surface(
-        self,
-        dt: datetime,
-        var_names: tuple[str, ...] | list[str],
-    ) -> dict[str, torch.Tensor]:
-        """Load surface variables for a single timestamp."""
+    def _load_surface_raw(self, dt: datetime) -> dict[str, torch.Tensor]:
+        """Load raw surface variables for a single timestamp (no density channels)."""
         key = (dt.year, dt.month)
         path = self.surface_files[key]
         ds = self._open_ds(path)
         idx = _surface_time_index(dt)
         sliced = ds.isel(valid_time=idx)
         result = {}
-        requested = set(var_names)
         for era5_name, aurora_name in self.surf_map.items():
-            if aurora_name not in requested:
-                continue
-            result[aurora_name] = torch.from_numpy(
-                sliced[era5_name].values
-            ).float()
+            result[aurora_name] = torch.from_numpy(sliced[era5_name].values).float()
         return result
+
+    def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
+        """Load surface variables with density channels applied."""
+        surf = self._load_surface_raw(dt)
+        if self.include_extra_surf:
+            surf = _add_density_channels(surf)
+        return surf
 
     def _load_atmos(self, dt: datetime) -> dict[str, torch.Tensor]:
         """Load atmospheric variables for a single timestamp."""
         info = _find_atmos_file(dt, self.atmos_chunks)
-        assert info is not None
+        assert info is not None, f"No atmospheric file covers {dt}"
         path, time_idx = info
         ds = self._open_ds(path)
         sliced = ds.isel(valid_time=time_idx)
         result = {}
         for era5_name, aurora_name in ATMOS_ERA5_TO_AURORA.items():
-            result[aurora_name] = torch.from_numpy(
-                sliced[era5_name].values
-            ).float()
+            result[aurora_name] = torch.from_numpy(sliced[era5_name].values).float()
         return result
+
+    def load_timestep(
+        self, dt: datetime
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Load all variables for a single timestamp.
+
+        Returns ``(surf_dict, atmos_dict)`` with density channels applied.
+        Useful for Stage 2 replay buffer ground-truth lookups.
+        """
+        return self._load_surface(dt), self._load_atmos(dt)
 
     def close(self):
         """Close all cached file handles."""
@@ -291,35 +380,36 @@ class ERA5Dataset(Dataset):
             ds.close()
         self._ds_cache.clear()
 
-    def __getitem__(self, idx: int) -> tuple[Batch, Batch]:
-        t0, t1, t2 = self.triplets[idx]
-
-        # Load 3 timestamps
-        surf0, surf1, surf2 = (
-            self._load_surface(t0, self.input_surf_vars),
-            self._load_surface(t1, self.input_surf_vars),
-            self._load_surface(t2, self.target_surf_vars),
+    def _make_target_batch(
+        self,
+        surf: dict[str, torch.Tensor],
+        atmos: dict[str, torch.Tensor],
+        time: datetime,
+    ) -> Batch:
+        return Batch(
+            surf_vars={k: v[None, None] for k, v in surf.items()},
+            static_vars=self.static_vars,
+            atmos_vars={k: v[None, None] for k, v in atmos.items()},
+            metadata=Metadata(
+                lat=self.lat,
+                lon=self.lon,
+                time=(time,),
+                atmos_levels=PRESSURE_LEVELS,
+            ),
         )
-        atmos0, atmos1, atmos2 = (
-            self._load_atmos(t0),
-            self._load_atmos(t1),
-            self._load_atmos(t2),
-        )
 
-        # Stack into history dimension: (2, H, W) for surf, (2, C, H, W) for atmos
-        # Then add batch dim: (1, 2, H, W) and (1, 2, C, H, W)
-        input_surf = {
-            k: torch.stack([surf0[k], surf1[k]])[None] for k in surf0
-        }
-        input_atmos = {
-            k: torch.stack([atmos0[k], atmos1[k]])[None] for k in atmos0
-        }
+    def __getitem__(self, idx: int) -> tuple[Batch, list[Batch]]:
+        timestamps = self.sequences[idx]
+        t0, t1 = timestamps[0], timestamps[1]
+        target_times = timestamps[2:]
 
-        # Target: single timestep with batch dim: (1, 1, H, W) and (1, 1, C, H, W)
-        target_surf = {k: surf2[k][None, None] for k in surf2}
-        target_atmos = {k: atmos2[k][None, None] for k in atmos2}
+        surf0 = self._load_surface(t0)
+        surf1 = self._load_surface(t1)
+        atmos0 = self._load_atmos(t0)
+        atmos1 = self._load_atmos(t1)
 
-        atmos_levels = PRESSURE_LEVELS
+        input_surf = {k: torch.stack([surf0[k], surf1[k]])[None] for k in surf0}
+        input_atmos = {k: torch.stack([atmos0[k], atmos1[k]])[None] for k in atmos0}
 
         input_batch = Batch(
             surf_vars=input_surf,
@@ -329,49 +419,35 @@ class ERA5Dataset(Dataset):
                 lat=self.lat,
                 lon=self.lon,
                 time=(t1,),
-                atmos_levels=atmos_levels,
+                atmos_levels=PRESSURE_LEVELS,
             ),
         )
 
-        target_batch = Batch(
-            surf_vars=target_surf,
-            static_vars=self.static_vars,
-            atmos_vars=target_atmos,
-            metadata=Metadata(
-                lat=self.lat,
-                lon=self.lon,
-                time=(t2,),
-                atmos_levels=atmos_levels,
-            ),
-        )
+        targets: list[Batch] = []
+        for tt in target_times:
+            surf_t = self._load_surface(tt)
+            atmos_t = self._load_atmos(tt)
+            targets.append(self._make_target_batch(surf_t, atmos_t, tt))
 
-        return input_batch, target_batch
+        return input_batch, targets
 
 
 # ---------------------------------------------------------------------------
 # Train / val / test split helper
 # ---------------------------------------------------------------------------
 
-# Default split for the soil-moisture fine-tuning task.
-#
-# Data: Jun-Aug 2024 and Jun-Aug 2025 (summer only, two years).
-#   Train : Jun 1 – Aug 1    both years  (~122 days, 66%)
-#   Val   : Aug 1 – Aug 16   both years  (~30 days,  17%)
-#   Test  : Aug 16 – Sep 1   both years  (~32 days,  17%)
-#
-# Val and test draw from both years so any performance difference reflects
-# generalization quality, not inter-annual weather variability.
+# Default split: train on June, val/test on July.
 DEFAULT_TRAIN_RANGES: list[tuple[datetime, datetime]] = [
-    (datetime(2024, 6, 1), datetime(2024, 8, 1)),   # Jun+Jul 2024
-    (datetime(2025, 6, 1), datetime(2025, 8, 1)),   # Jun+Jul 2025
+    (datetime(2024, 6, 1), datetime(2024, 7, 1)),
+    (datetime(2025, 6, 1), datetime(2025, 7, 1)),
 ]
 DEFAULT_VAL_RANGES: list[tuple[datetime, datetime]] = [
-    (datetime(2024, 8, 1), datetime(2024, 8, 16)),  # Aug 1-15 2024
-    (datetime(2025, 8, 1), datetime(2025, 8, 16)),  # Aug 1-15 2025
+    (datetime(2024, 7, 1), datetime(2024, 7, 16)),
+    (datetime(2025, 7, 1), datetime(2025, 7, 16)),
 ]
 DEFAULT_TEST_RANGES: list[tuple[datetime, datetime]] = [
-    (datetime(2024, 8, 16), datetime(2024, 9, 1)),  # Aug 16-31 2024
-    (datetime(2025, 8, 16), datetime(2025, 9, 1)),  # Aug 16-31 2025
+    (datetime(2024, 7, 16), datetime(2024, 8, 1)),
+    (datetime(2025, 7, 16), datetime(2025, 8, 1)),
 ]
 
 
@@ -388,6 +464,7 @@ class MultiRangeERA5Dataset(Dataset):
         date_ranges: list[tuple[datetime, datetime]],
         step_hours: int = 6,
         include_extra_surf: bool = True,
+        rollout_steps: int = 1,
     ):
         self.datasets: list[ERA5Dataset] = []
         self._lengths: list[int] = []
@@ -399,6 +476,7 @@ class MultiRangeERA5Dataset(Dataset):
                 end_date=end,
                 step_hours=step_hours,
                 include_extra_surf=include_extra_surf,
+                rollout_steps=rollout_steps,
             )
             self.datasets.append(ds)
             self._lengths.append(len(ds))
@@ -412,7 +490,7 @@ class MultiRangeERA5Dataset(Dataset):
     def __len__(self) -> int:
         return self._cumulative[-1] if self._cumulative else 0
 
-    def __getitem__(self, idx: int) -> tuple[Batch, Batch]:
+    def __getitem__(self, idx: int) -> tuple[Batch, list[Batch]]:
         for ds_idx, cum_len in enumerate(self._cumulative):
             if idx < cum_len:
                 offset = cum_len - self._lengths[ds_idx]
@@ -420,12 +498,17 @@ class MultiRangeERA5Dataset(Dataset):
         raise IndexError(f"index {idx} out of range for dataset of length {len(self)}")
 
     @property
-    def triplets(self) -> list:
-        """All triplets across sub-datasets (for inspection / debugging)."""
-        out = []
+    def sequences(self) -> list[tuple[datetime, ...]]:
+        """All timestamp sequences across sub-datasets."""
+        out: list[tuple[datetime, ...]] = []
         for ds in self.datasets:
-            out.extend(ds.triplets)
+            out.extend(ds.sequences)
         return out
+
+    @property
+    def triplets(self) -> list[tuple[datetime, ...]]:
+        """Backward-compat alias for sequences."""
+        return self.sequences
 
     def close(self):
         for ds in self.datasets:
@@ -439,13 +522,14 @@ def make_era5_splits(
     test_ranges: list[tuple[datetime, datetime]] | None = None,
     step_hours: int = 6,
     include_extra_surf: bool = True,
+    rollout_steps: int = 1,
 ) -> tuple[MultiRangeERA5Dataset, MultiRangeERA5Dataset, MultiRangeERA5Dataset]:
     """Create train / val / test splits from (possibly non-contiguous) date ranges.
 
     Defaults to the soil-moisture summer split:
-        Train : Jun+Jul 2024, Jun+Jul 2025
-        Val   : Aug 1-15 2024, Aug 1-15 2025
-        Test  : Aug 16-31 2024, Aug 16-31 2025
+        Train : June 2024, June 2025
+        Val   : Jul 1-15 2024, Jul 1-15 2025
+        Test  : Jul 16-31 2024, Jul 16-31 2025
     """
     if train_ranges is None:
         train_ranges = DEFAULT_TRAIN_RANGES
@@ -458,6 +542,7 @@ def make_era5_splits(
         data_dirs=data_dirs,
         step_hours=step_hours,
         include_extra_surf=include_extra_surf,
+        rollout_steps=rollout_steps,
     )
     train_ds = MultiRangeERA5Dataset(date_ranges=train_ranges, **kwargs)
     val_ds = MultiRangeERA5Dataset(date_ranges=val_ranges, **kwargs)
@@ -482,9 +567,9 @@ def make_random_batch(
     Set n_lat=721, n_lon=1440, n_levels=13 for full 0.25-degree resolution.
     """
     levels = PRESSURE_LEVELS[:n_levels]
-    surf_keys = SURF_VAR_NAMES
+    surf_keys: tuple[str, ...] = BASE_SURF_VAR_NAMES
     if include_extra_surf:
-        surf_keys = surf_keys + tuple(EXTRA_SURF_ERA5_TO_AURORA.values())
+        surf_keys = SOIL_SURF_VARS
 
     return Batch(
         surf_vars={k: torch.randn(batch_size, 2, n_lat, n_lon) for k in surf_keys},
@@ -513,16 +598,16 @@ def make_random_batch_sequence(
 ) -> list[Batch]:
     """Create a sequence of random batches for testing multi-step fine-tuning.
 
-    Each batch is offset by `step_hours` hours from the previous one.
-    Returns `steps` batches, each usable as input to get the next prediction.
+    Each batch is offset by ``step_hours`` hours from the previous one.
+    Returns ``steps`` batches, each usable as input to get the next prediction.
     """
     if start_time is None:
         start_time = datetime(2020, 6, 1, 0, 0)
 
     levels = PRESSURE_LEVELS[:n_levels]
-    surf_keys = SURF_VAR_NAMES
+    surf_keys: tuple[str, ...] = BASE_SURF_VAR_NAMES
     if include_extra_surf:
-        surf_keys = surf_keys + tuple(EXTRA_SURF_ERA5_TO_AURORA.values())
+        surf_keys = SOIL_SURF_VARS
     batches = []
 
     for i in range(steps):

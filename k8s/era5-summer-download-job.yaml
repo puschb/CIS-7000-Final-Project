@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: era5-jun-jul-download
+  name: era5-jun-jul-download-v3
 spec:
   backoffLimit: 5
   activeDeadlineSeconds: 604800  # 7 days
