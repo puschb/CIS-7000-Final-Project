@@ -24,30 +24,20 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
+import pandas as pd
 import xarray as xr
 
 
 def _to_naive_utc(val) -> datetime:
-    """Decode xarray time coordinate value to naive UTC ``datetime``."""
-    if isinstance(val, datetime):
+    """Decode xarray time coordinate (numpy, cftime, or datetime) to naive UTC."""
+    if type(val) is datetime:
         if val.tzinfo is not None:
             return val.astimezone(timezone.utc).replace(tzinfo=None)
         return val
-    try:
-        v = np.datetime64(val, "s")
-        sec = int(v.astype("datetime64[s]").astype("int64"))
-        return datetime.utcfromtimestamp(sec)
-    except (TypeError, ValueError, OverflowError):
-        pass
-    return datetime(
-        int(val.year),
-        int(val.month),
-        int(val.day),
-        int(getattr(val, "hour", 0)),
-        int(getattr(val, "minute", 0)),
-        int(getattr(val, "second", 0)),
-    )
+    ts = pd.Timestamp(val)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts.to_pydatetime()
 
 
 def _encoding_for(ds: xr.Dataset) -> dict[str, dict]:
