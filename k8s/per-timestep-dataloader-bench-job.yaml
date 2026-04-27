@@ -60,21 +60,31 @@ spec:
               cd /opt/repo
               export PYTHONPATH=/opt/repo
               OUT=/mnt/data/era5/per-step-bench-2024-06-d16-18
-              mkdir -p "$OUT"
-              echo "=== Split chunk -> per-hour files -> $OUT ==="
-              python -u scripts/split_chunk_to_per_timestep.py \
-                --atmos-src /mnt/data/era5/2024/2024-06-d16-18-atmospheric.nc \
-                --surface-src /mnt/data/era5/2024/2024-06-surface.nc \
-                --static-src /mnt/data/era5/2024/static.nc \
-                --out-dir "$OUT"
+
+              # Only split if the directory is empty / does not yet have the
+              # per-hour files, so retries skip the ~10-minute write step.
+              NFILES=$(ls "$OUT"/*-atmospheric.nc 2>/dev/null | wc -l || echo 0)
+              if [ "$NFILES" -lt 72 ]; then
+                echo "=== Split chunk -> per-hour files -> $OUT ==="
+                mkdir -p "$OUT"
+                python -u scripts/split_chunk_to_per_timestep.py \
+                  --atmos-src /mnt/data/era5/2024/2024-06-d16-18-atmospheric.nc \
+                  --surface-src /mnt/data/era5/2024/2024-06-surface.nc \
+                  --static-src /mnt/data/era5/2024/static.nc \
+                  --out-dir "$OUT"
+              else
+                echo "=== Per-hour files already present ($NFILES atmos files), skipping split ==="
+              fi
+
               echo ""
-              echo "=== Benchmark (per_timestep layout) ==="
+              echo "=== Benchmark (per_timestep layout, 12 workers, prefetch=2) ==="
               python -u scripts/benchmark_dataloader.py \
                 --data-dir "$OUT" \
                 --file-layout per_timestep \
-                --workers 8 \
-                --batch-sizes 1 2 4 8 \
-                --n-batches 6
+                --workers 12 \
+                --prefetch-factor 2 \
+                --batch-sizes 1 \
+                --n-batches 20
           volumeMounts:
             - name: repo
               mountPath: /opt/repo
@@ -84,11 +94,11 @@ spec:
               mountPath: /dev/shm
           resources:
             requests:
-              memory: 24Gi
-              cpu: "4"
+              memory: 48Gi
+              cpu: "12"
             limits:
-              memory: 24Gi
-              cpu: "8"
+              memory: 48Gi
+              cpu: "12"
       volumes:
         - name: repo
           emptyDir: {}
@@ -98,4 +108,4 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 10Gi
+            sizeLimit: 24Gi
