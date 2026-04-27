@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--n-batches", type=int, default=6,
                         help="Batches to pull per batch_size test")
+    parser.add_argument("--prefetch-factor", type=int, default=1,
+                        help="Prefetch factor per worker (default 1)")
     parser.add_argument(
         "--file-layout",
         choices=("chunked", "per_timestep"),
@@ -64,6 +66,7 @@ def main():
     print(f"File layout:   {args.file_layout}")
     print(f"Rollout steps: {args.rollout_steps}")
     print(f"Workers:       {args.workers}")
+    print(f"Prefetch/wkr:  {args.prefetch_factor}")
     print(f"Batch sizes:   {args.batch_sizes}")
     print(f"CPU count:     {os.cpu_count()}")
     print(f"RAM:           {bytes_to_mb(psutil.virtual_memory().total):.0f} MB")
@@ -144,7 +147,7 @@ def main():
     # -------------------------------------------------------------------------
     # 2. DataLoader throughput at different batch sizes
     # -------------------------------------------------------------------------
-    print(f"=== DataLoader throughput ({args.workers} workers) ===")
+    print(f"=== DataLoader throughput ({args.workers} workers, prefetch={args.prefetch_factor}) ===")
     print(f"{'batch_size':>12}  {'warmup':>8}  {'avg/batch':>10}  "
           f"{'samples/s':>10}  {'batch_MB':>10}  {'shm_used':>10}")
     print("-" * 68)
@@ -155,7 +158,7 @@ def main():
             batch_size=bs,
             shuffle=True,
             num_workers=args.workers,
-            prefetch_factor=1,
+            prefetch_factor=args.prefetch_factor,
             persistent_workers=True,
             worker_init_fn=era5_worker_init_fn,
             collate_fn=collate_era5_batch,
