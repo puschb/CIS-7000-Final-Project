@@ -6,6 +6,7 @@ import calendar
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -109,6 +110,53 @@ def _parse_atmos_files(data_dir: Path) -> list[tuple[datetime, datetime, Path]]:
             dt_end = datetime(year, month, day_end, 23, 0)
             chunks.append((dt_start, dt_end, f))
     return chunks
+
+
+# One NetCDF per valid_time (ISO-like stem), e.g. ``2024-06-16T09-surface.nc``.
+_PER_TIMESTEP_SURF = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2})-surface\.nc$"
+)
+_PER_TIMESTEP_ATMOS = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2})-atmospheric\.nc$"
+)
+
+
+def _parse_per_timestep_surface_files(data_dir: Path) -> dict[datetime, Path]:
+    """Map UTC hour ``datetime`` -> single-timestep surface NetCDF path."""
+    out: dict[datetime, Path] = {}
+    for f in sorted(data_dir.glob("*-surface.nc")):
+        m = _PER_TIMESTEP_SURF.match(f.name)
+        if not m:
+            continue
+        dt = datetime(
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+            int(m.group(4)),
+            0,
+            0,
+        )
+        out[dt] = f
+    return out
+
+
+def _parse_per_timestep_atmos_files(data_dir: Path) -> dict[datetime, Path]:
+    """Map UTC hour ``datetime`` -> single-timestep atmospheric NetCDF path."""
+    out: dict[datetime, Path] = {}
+    for f in sorted(data_dir.glob("*-atmospheric.nc")):
+        m = _PER_TIMESTEP_ATMOS.match(f.name)
+        if not m:
+            continue
+        dt = datetime(
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+            int(m.group(4)),
+            0,
+            0,
+        )
+        out[dt] = f
+    return out
 
 
 def _find_atmos_file(
@@ -218,6 +266,10 @@ class ERA5Dataset(Dataset):
         step_hours: Time gap between consecutive steps (default 6h).
         include_extra_surf: Include soil/snow variables and density channels.
         rollout_steps: Number of target timesteps (1 or 2).
+        file_layout: ``"chunked"`` — monthly surface + multi-day atmospheric
+            NetCDFs (default). ``"per_timestep"`` — one small NetCDF per UTC
+            hour, names ``YYYY-MM-DDTHH-{surface,atmospheric}.nc`` (see
+            ``scripts/split_chunk_to_per_timestep.py``).
     """
 
     def __init__(
@@ -228,6 +280,7 @@ class ERA5Dataset(Dataset):
         step_hours: int = 6,
         include_extra_surf: bool = True,
         rollout_steps: int = 1,
+        file_layout: Literal["chunked", "per_timestep"] = "chunked",
     ):
         if isinstance(data_dirs, (str, Path)):
             data_dirs = [data_dirs]
@@ -235,27 +288,43 @@ class ERA5Dataset(Dataset):
         self.step_hours = step_hours
         self.include_extra_surf = include_extra_surf
         self.rollout_steps = rollout_steps
+        self.file_layout = file_layout
 
         self.surf_map = SURF_ERA5_TO_AURORA.copy()
         if include_extra_surf:
             self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
 
-        # Build file indices across all data directories
         self.surface_files: dict[tuple[int, int], Path] = {}
         self.atmos_chunks: list[tuple[datetime, datetime, Path]] = []
+        self.surf_paths_by_time: dict[datetime, Path] = {}
+        self.atmos_paths_by_time: dict[datetime, Path] = {}
         static_path = None
 
         for d in self.data_dirs:
-            self.surface_files.update(_parse_surface_files(d))
-            self.atmos_chunks.extend(_parse_atmos_files(d))
             candidate = d / "static.nc"
             if candidate.exists() and static_path is None:
                 static_path = candidate
+
+            if file_layout == "chunked":
+                self.surface_files.update(_parse_surface_files(d))
+                self.atmos_chunks.extend(_parse_atmos_files(d))
+            elif file_layout == "per_timestep":
+                self.surf_paths_by_time.update(_parse_per_timestep_surface_files(d))
+                self.atmos_paths_by_time.update(_parse_per_timestep_atmos_files(d))
+            else:
+                raise ValueError(f"Unknown file_layout: {file_layout!r}")
 
         self.atmos_chunks.sort(key=lambda x: x[0])
 
         if static_path is None:
             raise FileNotFoundError("No static.nc found in any data directory")
+
+        if file_layout == "per_timestep":
+            if not self.surf_paths_by_time or not self.atmos_paths_by_time:
+                raise FileNotFoundError(
+                    "per_timestep layout requires per-hour "
+                    "*-surface.nc and *-atmospheric.nc files in data_dirs"
+                )
 
         # Load static vars once (small, reused every sample)
         static_ds = xr.open_dataset(static_path, engine="netcdf4")
@@ -286,6 +355,9 @@ class ERA5Dataset(Dataset):
         ``rollout_steps=1`` → ``(t-6h, t, t+6h)``
         ``rollout_steps=2`` → ``(t-6h, t, t+6h, t+12h)``
         """
+        if self.file_layout == "per_timestep":
+            return self._build_sequences_per_timestep(start_date, end_date)
+
         step = timedelta(hours=self.step_hours)
         sequences: list[tuple[datetime, ...]] = []
 
@@ -324,6 +396,35 @@ class ERA5Dataset(Dataset):
 
         return sequences
 
+    def _build_sequences_per_timestep(
+        self,
+        start_date: datetime | None,
+        end_date: datetime | None,
+    ) -> list[tuple[datetime, ...]]:
+        """Sequence builder when each hour lives in its own NetCDF pair."""
+        step = timedelta(hours=self.step_hours)
+        avail = set(self.surf_paths_by_time) & set(self.atmos_paths_by_time)
+        sequences: list[tuple[datetime, ...]] = []
+
+        for t1 in sorted(avail):
+            if start_date and t1 < start_date:
+                continue
+            if end_date and t1 >= end_date:
+                continue
+
+            t0 = t1 - step
+            targets = [t1 + step * i for i in range(1, self.rollout_steps + 1)]
+            timestamps = [t0, t1] + targets
+
+            if not all(ts in avail for ts in timestamps):
+                continue
+            if any(ts.month != t1.month or ts.year != t1.year for ts in timestamps):
+                continue
+
+            sequences.append(tuple(timestamps))
+
+        return sequences
+
     def __len__(self) -> int:
         return len(self.sequences)
 
@@ -335,11 +436,16 @@ class ERA5Dataset(Dataset):
 
     def _load_surface_raw(self, dt: datetime) -> dict[str, torch.Tensor]:
         """Load raw surface variables for a single timestamp (no density channels)."""
-        key = (dt.year, dt.month)
-        path = self.surface_files[key]
-        ds = self._open_ds(path)
-        idx = _surface_time_index(dt)
-        sliced = ds.isel(valid_time=idx)
+        if self.file_layout == "per_timestep":
+            path = self.surf_paths_by_time[dt]
+            ds = self._open_ds(path)
+            sliced = ds.isel(valid_time=0)
+        else:
+            key = (dt.year, dt.month)
+            path = self.surface_files[key]
+            ds = self._open_ds(path)
+            idx = _surface_time_index(dt)
+            sliced = ds.isel(valid_time=idx)
         result = {}
         for era5_name, aurora_name in self.surf_map.items():
             result[aurora_name] = torch.from_numpy(sliced[era5_name].values).float()
@@ -354,11 +460,16 @@ class ERA5Dataset(Dataset):
 
     def _load_atmos(self, dt: datetime) -> dict[str, torch.Tensor]:
         """Load atmospheric variables for a single timestamp."""
-        info = _find_atmos_file(dt, self.atmos_chunks)
-        assert info is not None, f"No atmospheric file covers {dt}"
-        path, time_idx = info
-        ds = self._open_ds(path)
-        sliced = ds.isel(valid_time=time_idx)
+        if self.file_layout == "per_timestep":
+            path = self.atmos_paths_by_time[dt]
+            ds = self._open_ds(path)
+            sliced = ds.isel(valid_time=0)
+        else:
+            info = _find_atmos_file(dt, self.atmos_chunks)
+            assert info is not None, f"No atmospheric file covers {dt}"
+            path, time_idx = info
+            ds = self._open_ds(path)
+            sliced = ds.isel(valid_time=time_idx)
         result = {}
         for era5_name, aurora_name in ATMOS_ERA5_TO_AURORA.items():
             result[aurora_name] = torch.from_numpy(sliced[era5_name].values).float()
@@ -465,6 +576,7 @@ class MultiRangeERA5Dataset(Dataset):
         step_hours: int = 6,
         include_extra_surf: bool = True,
         rollout_steps: int = 1,
+        file_layout: Literal["chunked", "per_timestep"] = "chunked",
     ):
         self.datasets: list[ERA5Dataset] = []
         self._lengths: list[int] = []
@@ -477,6 +589,7 @@ class MultiRangeERA5Dataset(Dataset):
                 step_hours=step_hours,
                 include_extra_surf=include_extra_surf,
                 rollout_steps=rollout_steps,
+                file_layout=file_layout,
             )
             self.datasets.append(ds)
             self._lengths.append(len(ds))
@@ -523,6 +636,7 @@ def make_era5_splits(
     step_hours: int = 6,
     include_extra_surf: bool = True,
     rollout_steps: int = 1,
+    file_layout: Literal["chunked", "per_timestep"] = "chunked",
 ) -> tuple[MultiRangeERA5Dataset, MultiRangeERA5Dataset, MultiRangeERA5Dataset]:
     """Create train / val / test splits from (possibly non-contiguous) date ranges.
 
@@ -543,6 +657,7 @@ def make_era5_splits(
         step_hours=step_hours,
         include_extra_surf=include_extra_surf,
         rollout_steps=rollout_steps,
+        file_layout=file_layout,
     )
     train_ds = MultiRangeERA5Dataset(date_ranges=train_ranges, **kwargs)
     val_ds = MultiRangeERA5Dataset(date_ranges=val_ranges, **kwargs)

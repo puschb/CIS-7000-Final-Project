@@ -7,6 +7,8 @@ Tests:
 Usage:
     python -u scripts/benchmark_dataloader.py --data-dir /mnt/data/era5/2024 /mnt/data/era5/2025
     python -u scripts/benchmark_dataloader.py --data-dir /mnt/data/era5/2024 --rollout-steps 2
+    python -u scripts/benchmark_dataloader.py --data-dir /mnt/data/era5/per-step-bench \\
+        --file-layout per_timestep
 """
 
 from __future__ import annotations
@@ -49,9 +51,17 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--n-batches", type=int, default=6,
                         help="Batches to pull per batch_size test")
+    parser.add_argument(
+        "--file-layout",
+        choices=("chunked", "per_timestep"),
+        default="chunked",
+        help="chunked: monthly surface + dXX-YY-atmospheric; "
+        "per_timestep: YYYY-MM-DDTHH-*.nc (see split_chunk_to_per_timestep.py)",
+    )
     args = parser.parse_args()
 
     print(f"Data dirs:     {args.data_dir}")
+    print(f"File layout:   {args.file_layout}")
     print(f"Rollout steps: {args.rollout_steps}")
     print(f"Workers:       {args.workers}")
     print(f"Batch sizes:   {args.batch_sizes}")
@@ -63,8 +73,25 @@ def main():
               f"{bytes_to_mb(st.f_blocks * st.f_frsize):.0f} MB free")
     print()
 
-    ds = ERA5Dataset(data_dirs=args.data_dir, rollout_steps=args.rollout_steps)
-    print(f"Dataset: {len(ds)} samples")
+    ds = ERA5Dataset(
+        data_dirs=args.data_dir,
+        rollout_steps=args.rollout_steps,
+        file_layout=args.file_layout,
+    )
+    n_samples = len(ds)
+    if n_samples == 0:
+        raise SystemExit("Dataset has zero samples (check date range and files).")
+
+    batch_sizes = [b for b in args.batch_sizes if b <= n_samples]
+    if not batch_sizes:
+        batch_sizes = [1]
+    if batch_sizes != args.batch_sizes:
+        print(
+            f"Note: batch_sizes filtered to <= dataset len ({n_samples}): {batch_sizes}"
+        )
+        print()
+
+    print(f"Dataset: {n_samples} samples")
     print(f"First sequence: {ds.sequences[0]}")
     print()
 
@@ -122,7 +149,7 @@ def main():
           f"{'samples/s':>10}  {'batch_MB':>10}  {'shm_used':>10}")
     print("-" * 68)
 
-    for bs in args.batch_sizes:
+    for bs in batch_sizes:
         loader = DataLoader(
             ds,
             batch_size=bs,

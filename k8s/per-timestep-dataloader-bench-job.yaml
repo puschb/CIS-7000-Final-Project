@@ -1,0 +1,101 @@
+# One-off Job: split a known-good June 3-day atmospheric chunk + June surface
+# into per-hour NetCDF pairs on the era5-rechunked PVC, copy static.nc, then run
+# scripts/benchmark_dataloader.py with --file-layout per_timestep.
+#
+# Default chunk: 2024-06-d16-18 (edit paths in the container script if needed).
+#
+# Usage:
+#   kubectl -n upenn-dyer-lab create -f k8s/per-timestep-dataloader-bench-job.yaml
+#   kubectl -n upenn-dyer-lab logs -f job/per-timestep-dataloader-bench
+#   kubectl -n upenn-dyer-lab delete job per-timestep-dataloader-bench
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: per-timestep-dataloader-bench
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
+      initContainers:
+        - name: clone-repo
+          image: alpine/git
+          env:
+            - name: GIT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: github-secret
+                  key: user
+            - name: GIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: github-secret
+                  key: password
+          args:
+            - clone
+            - --single-branch
+            - --depth=1
+            - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+            - /opt/repo
+          volumeMounts:
+            - name: repo
+              mountPath: /opt/repo
+      containers:
+        - name: split-and-bench
+          image: puschb/aurora-dev:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cd /opt/repo
+              export PYTHONPATH=/opt/repo
+              OUT=/mnt/data/era5/per-step-bench-2024-06-d16-18
+              mkdir -p "$OUT"
+              echo "=== Split chunk -> per-hour files -> $OUT ==="
+              python -u scripts/split_chunk_to_per_timestep.py \
+                --atmos-src /mnt/data/era5/2024/2024-06-d16-18-atmospheric.nc \
+                --surface-src /mnt/data/era5/2024/2024-06-surface.nc \
+                --static-src /mnt/data/era5/2024/static.nc \
+                --out-dir "$OUT"
+              echo ""
+              echo "=== Benchmark (per_timestep layout) ==="
+              python -u scripts/benchmark_dataloader.py \
+                --data-dir "$OUT" \
+                --file-layout per_timestep \
+                --workers 8 \
+                --batch-sizes 1 2 4 8 \
+                --n-batches 6
+          volumeMounts:
+            - name: repo
+              mountPath: /opt/repo
+            - name: data
+              mountPath: /mnt/data
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              memory: 24Gi
+              cpu: "4"
+            limits:
+              memory: 24Gi
+              cpu: "8"
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: era5-rechunked
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Gi
