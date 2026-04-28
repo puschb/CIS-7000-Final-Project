@@ -45,7 +45,6 @@ from aurora import AuroraSmallPretrained, Batch, Metadata
 from aurora.normalisation import locations, scales
 
 from src.data import (
-    ATMOS_VAR_NAMES,
     DENSITY_VARS,
     PRESSURE_LEVELS,
     SOIL_SURF_VARS,
@@ -399,6 +398,18 @@ def main() -> None:
         use_lora=False,
     )
     model.load_checkpoint(strict=False)
+    # Zero-init new-variable patch embeddings in the encoder (and decoder if present).
+    # By default Aurora initialises them randomly, which perturbs existing-variable
+    # predictions.  The paper uses zero-init for new wave variables (Section B.8).
+    _new_surf_vars = [v for v in SOIL_SURF_VARS if v not in {"2t", "10u", "10v", "msl"}]
+    for var in _new_surf_vars:
+        if var in model.encoder.surf_token_embeds.weights:
+            model.encoder.surf_token_embeds.weights[var].data.zero_()
+            log.info(f"  Zero-initialised encoder.surf_token_embeds.weights[{var!r}]")
+        if hasattr(model, "decoder") and hasattr(model.decoder, "surf_token_embeds"):
+            if var in model.decoder.surf_token_embeds.weights:
+                model.decoder.surf_token_embeds.weights[var].data.zero_()
+                log.info(f"  Zero-initialised decoder.surf_token_embeds.weights[{var!r}]")
     model.configure_activation_checkpointing()
     model = model.to(device)
     model.train()
@@ -461,17 +472,21 @@ def main() -> None:
 
         optimizer.zero_grad()
         current = input_batch
+        total_loss = torch.tensor(0.0, device=device)
         rollout_records: list[dict] = []
 
         for target in targets:
             target_gpu = target.to(device)
             pred = model(current)
             loss, per_var = weighted_mae_loss(pred, target_gpu, device)
-            (loss / len(targets)).backward()
+            total_loss = total_loss + loss / len(targets)
             rollout_records.append(per_var)
             if len(targets) > 1:
                 current = assemble_next_input(current, pred)
 
+        # Single backward through all rollout steps so gradients flow through
+        # every forward pass (true multi-step backprop, not the pushforward trick).
+        total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
