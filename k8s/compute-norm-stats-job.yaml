@@ -48,12 +48,12 @@ spec:
               cd /opt/repo
               export PYTHONPATH=/opt/repo
               echo "=== Available data ==="
-              ls /mnt/data/era5/per-step/2024/ 2>/dev/null | head -6 || echo "No per-step/2024 dir"
-              ls /mnt/data/era5/per-step/2025/ 2>/dev/null | head -6 || echo "No per-step/2025 dir"
+              ls /mnt/data/era5/2024/ 2>/dev/null | head -6 || echo "No 2024 dir"
+              ls /mnt/data/era5/2025/ 2>/dev/null | head -6 || echo "No 2025 dir"
               echo ""
               echo "=== Computing normalisation stats (training split only) ==="
               python -u scripts/compute_norm_stats.py \
-                --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025
+                --data-dir /mnt/data/era5/2024 /mnt/data/era5/2025
           volumeMounts:
             - name: repo
               mountPath: /opt/repo

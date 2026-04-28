@@ -1,23 +1,25 @@
 """Compute normalisation statistics (mean, std) for new ERA5 surface variables.
 
-Reads the per-timestep layout produced by scripts/split_chunk_to_per_timestep.py:
-files named ``YYYY-MM-DDTHH-surface.nc`` under the data directories.
+Scans the original monthly surface files (``YYYY-MM-surface.nc``) which are
+much faster to iterate because you only open ~4 files total (Jun+Jul × 2 years)
+instead of ~2,880 individual per-timestep files.  The monthly files are still
+present on the PVC at /mnt/data/era5/2024/ and /mnt/data/era5/2025/.
 
 Only processes timestamps within the TRAINING split (Jun+Jul 2024, Jun+Jul 2025)
 to avoid data leakage from val/test.
 
 Uses Welford's online algorithm so the full dataset never needs to fit in memory.
-Each file contains exactly one timestep so we open it, read the arrays, and close.
 
 Usage:
     python -u scripts/compute_norm_stats.py \
-        --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025
+        --data-dir /mnt/data/era5/2024 /mnt/data/era5/2025
     python -u scripts/compute_norm_stats.py \
-        --data-dir /mnt/data/era5/per-step/2024 --vars swvl1 stl1 sd
+        --data-dir /mnt/data/era5/2024 --vars swvl1 stl1 sd
 """
 
 import argparse
 import re
+from calendar import monthrange
 from datetime import datetime
 from pathlib import Path
 
@@ -32,15 +34,18 @@ TRAIN_RANGES: list[tuple[datetime, datetime]] = [
     (datetime(2025, 6, 1), datetime(2025, 8, 1)),
 ]
 
-# Per-timestep file pattern: 2024-06-16T12-surface.nc
-_PER_STEP_PAT = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2})-surface\.nc$")
+# Monthly surface file pattern: 2024-06-surface.nc
+_MONTHLY_PAT = re.compile(r"^(\d{4})-(\d{2})-surface\.nc$")
 
 
-def _parse_per_step_dt(fname: str) -> datetime | None:
-    m = _PER_STEP_PAT.match(fname)
-    if not m:
-        return None
-    return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+def _month_in_train(year: int, month: int) -> bool:
+    """True if any day of this (year, month) falls within a training range."""
+    month_start = datetime(year, month, 1)
+    month_end = datetime(year, month, monthrange(year, month)[1], 23, 59)
+    for rng_start, rng_end in TRAIN_RANGES:
+        if month_start < rng_end and month_end >= rng_start:
+            return True
+    return False
 
 
 def _timestamp_in_train(dt: datetime) -> bool:
@@ -79,24 +84,21 @@ def _welford_update(
 def compute_stats(
     data_dirs: list[Path], var_names: list[str]
 ) -> dict[str, dict[str, float]]:
-    """Compute global mean and std using per-timestep surface files in data_dirs."""
-    surface_files: list[tuple[datetime, Path]] = []
+    """Compute global mean and std for each variable using monthly surface files."""
+    surface_files: list[Path] = []
     for d in data_dirs:
         for f in sorted(d.glob("*-surface.nc")):
-            dt = _parse_per_step_dt(f.name)
-            if dt is not None and _timestamp_in_train(dt):
-                surface_files.append((dt, f))
-
-    surface_files.sort(key=lambda x: x[0])
+            m = _MONTHLY_PAT.match(f.name)
+            if m and _month_in_train(int(m.group(1)), int(m.group(2))):
+                surface_files.append(f)
 
     if not surface_files:
         raise FileNotFoundError(
-            f"No training-split YYYY-MM-DDTHH-surface.nc files found in {data_dirs}.\n"
-            f"Expected layout: per-timestep files from split_chunk_to_per_timestep.py\n"
+            f"No training-split YYYY-MM-surface.nc files found in {data_dirs}.\n"
             f"Training ranges: {TRAIN_RANGES}"
         )
 
-    print(f"Found {len(surface_files)} per-timestep surface files in training split")
+    print(f"Found {len(surface_files)} monthly surface files in training split")
     print(f"Training ranges: {TRAIN_RANGES}")
     print(f"Variables: {var_names}\n")
 
@@ -106,22 +108,23 @@ def compute_stats(
     vmin: dict[str, float] = {v: float("inf") for v in var_names}
     vmax: dict[str, float] = {v: float("-inf") for v in var_names}
 
-    log_every = max(1, len(surface_files) // 20)
-    for i, (dt, fpath) in enumerate(surface_files):
+    for fpath in surface_files:
+        print(f"  Opening {fpath.name} ...", end="", flush=True)
         ds = xr.open_dataset(fpath, engine="netcdf4")
-        for var in var_names:
-            if var not in ds:
+        times = ds["valid_time"].values
+        n_included = 0
+        for t_idx in range(len(times)):
+            dt = np.datetime64(times[t_idx], "us").astype("datetime64[s]").item()
+            if not _timestamp_in_train(dt):
                 continue
-            arr = ds[var].isel(valid_time=0).values.astype(np.float64).ravel()
-            _welford_update(count, mean, m2, vmin, vmax, var, arr)
+            n_included += 1
+            for var in var_names:
+                if var not in ds:
+                    continue
+                arr = ds[var].isel(valid_time=t_idx).values.astype(np.float64).ravel()
+                _welford_update(count, mean, m2, vmin, vmax, var, arr)
         ds.close()
-
-        if (i + 1) % log_every == 0 or i + 1 == len(surface_files):
-            print(
-                f"  {i + 1}/{len(surface_files)}  {fpath.name}  "
-                f"(swvl1 n={count.get('swvl1', 0):,})",
-                flush=True,
-            )
+        print(f" ({n_included} timesteps in training range)", flush=True)
 
     results: dict[str, dict[str, float]] = {}
     for var in var_names:
