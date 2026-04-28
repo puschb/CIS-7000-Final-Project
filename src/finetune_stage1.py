@@ -452,24 +452,36 @@ def main() -> None:
     # ── Training loop ────────────────────────────────────────────────────────
     log.info(
         f"\nStarting training: {args.steps} steps | rollout_steps={args.rollout_steps} | "
-        f"warmup={args.warmup_steps} | val_every={args.val_every}"
+        f"warmup={args.warmup_steps} | val_every={args.val_every} | "
+        f"train_samples={len(train_ds):,} (~{args.steps / len(train_ds):.1f} epochs)"
     )
 
     best_val_loss = float("inf")
     train_iter = iter(train_loader)
     step = 0
+    epoch = 0
+    samples_since_epoch_start = 0
+    # Rolling window for smoothed throughput (last 20 steps)
+    _recent_step_times: list[float] = []
 
     while step < args.steps:
-        t0 = time.time()
-
+        # ── fetch batch (DataLoader / I/O time) ──────────────────────────────
+        t_io_start = time.time()
         try:
             input_batch, targets = next(train_iter)
+            samples_since_epoch_start += 1
         except StopIteration:
+            epoch += 1
+            log.info(f"── Epoch {epoch} complete (step {step}) ──────────────────────────────")
             train_iter = iter(train_loader)
             input_batch, targets = next(train_iter)
+            samples_since_epoch_start = 1
+        t_io = time.time() - t_io_start
 
         input_batch = input_batch.to(device)
 
+        # ── forward / backward / optimizer (compute time) ────────────────────
+        t_compute_start = time.time()
         optimizer.zero_grad()
         current = input_batch
         total_loss = torch.tensor(0.0, device=device)
@@ -490,32 +502,49 @@ def main() -> None:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
-        step += 1
+        if device.type == "cuda":
+            torch.cuda.synchronize()   # ensure compute time excludes async queuing
+        t_compute = time.time() - t_compute_start
 
-        step_time = time.time() - t0
+        step += 1
+        step_time = t_io + t_compute
+
+        # Smoothed throughput over last 20 steps
+        _recent_step_times.append(step_time)
+        if len(_recent_step_times) > 20:
+            _recent_step_times.pop(0)
+        samples_per_sec = 1.0 / (sum(_recent_step_times) / len(_recent_step_times))
+
         lrs = [pg["lr"] for pg in optimizer.param_groups]
         avg = _avg_per_var(rollout_records)
 
         writer.log({
-            "phase":         "train",
-            "step":          step,
+            "phase":            "train",
+            "step":             step,
+            "epoch":            epoch,
             **avg,
-            "grad_norm":     grad_norm.item(),
-            "lr_base":       lrs[0],
-            "lr_new_embed":  lrs[1],
-            "step_time_s":   step_time,
+            "grad_norm":        grad_norm.item(),
+            "lr_base":          lrs[0],
+            "lr_new_embed":     lrs[1],
+            "step_time_s":      step_time,
+            "io_time_s":        t_io,
+            "compute_time_s":   t_compute,
+            "samples_per_sec":  samples_per_sec,
         })
 
-        if step % 50 == 0:
+        if step % 10 == 0:
+            pct = 100.0 * step / args.steps
+            eta_s = (args.steps - step) * (sum(_recent_step_times) / len(_recent_step_times))
+            eta_min = eta_s / 60
             log.info(
-                f"step {step:>5}/{args.steps} | "
+                f"[{pct:5.1f}%] step {step:>5}/{args.steps} ep{epoch} | "
                 f"loss={avg['loss_total']:.4f} | "
-                f"mae_swvl1={avg.get('mae_swvl1', float('nan')):.4f} | "
-                f"mae_stl1={avg.get('mae_stl1', float('nan')):.4f} | "
-                f"mae_sd={avg.get('mae_sd', float('nan')):.4f} | "
-                f"grad={grad_norm:.3f} | "
-                f"lr={lrs[0]:.2e} | "
-                f"t={step_time:.1f}s"
+                f"swvl1={avg.get('mae_swvl1', float('nan')):.4f} "
+                f"stl1={avg.get('mae_stl1', float('nan')):.4f} "
+                f"sd={avg.get('mae_sd', float('nan')):.4f} | "
+                f"grad={grad_norm:.3f} lr={lrs[0]:.1e} | "
+                f"io={t_io:.1f}s gpu={t_compute:.1f}s | "
+                f"{samples_per_sec:.2f}samp/s ETA={eta_min:.0f}min"
             )
 
         # ── Validation ───────────────────────────────────────────────────────
