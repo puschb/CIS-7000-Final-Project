@@ -20,17 +20,17 @@ ALL_SURF_VARS = SURF_VAR_NAMES + tuple(EXTRA_SURF_ERA5_TO_AURORA.values())
 # Normalisation statistics for the new surface variables.
 #
 # These MUST be computed from your ERA5 training data before real training.
-# Run ``python -m scripts.compute_norm_stats --data-dir /mnt/data/era5`` to
-# compute them, then paste the values here.
+# Run ``python -u scripts/compute_norm_stats.py --data-dir /mnt/data/era5/2024 ...``
+# (see k8s/compute-norm-stats-job.yaml). Output is stdout only; paste into here.
+# _register_new_var_normalisation() then copies them into aurora.normalisation.
 #
-# The placeholder values below (mean=0, std=1) will let the code run but will
-# produce poor training dynamics.  Replace them with real values.
+# Values from compute-norm-stats job (train split only, monthly surface files).
 # ---------------------------------------------------------------------------
 _NEW_VAR_NORM: dict[str, tuple[float, float]] = {
     # (location/mean, scale/std)
-    "swvl1": (0.0, 1.0),  # TODO: replace with real stats
-    "stl1": (0.0, 1.0),   # TODO: replace with real stats
-    "sd": (0.0, 1.0),     # TODO: replace with real stats
+    "swvl1": (8.707704e-02, 1.428390e-01),
+    "stl1": (2.823009e02, 2.123255e01),
+    "sd": (1.151846e00, 3.172587e00),
 }
 
 
