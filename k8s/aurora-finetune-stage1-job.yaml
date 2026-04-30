@@ -4,7 +4,7 @@
 #   - 12 CPUs  (1 per DataLoader worker, workers ≈ 4× faster than GPU can consume)
 #   - 48 Gi RAM  (workers + val loader + model activations)
 #   - 24 Gi /dev/shm  (PyTorch shared-memory IPC between workers and main process)
-#   - 1× NVIDIA L40 (48 GB VRAM)
+#   - 1× 48 GB GPU (L40, L40S, or RTX-A6000)
 #
 # Usage:
 #   kubectl -n upenn-dyer-lab create -f k8s/aurora-finetune-stage1-job.yaml
@@ -27,6 +27,8 @@ spec:
                 operator: In
                 values:
                 - NVIDIA-L40
+                - NVIDIA-L40S
+                - NVIDIA-RTX-A6000
       initContainers:
       - name: clone-repo
         image: alpine/git

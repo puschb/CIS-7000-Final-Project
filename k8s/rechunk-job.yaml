@@ -1,12 +1,12 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rechunk-era5-v4
+  name: rechunk-era5-v5
 spec:
   completionMode: Indexed
-  completions: 25
+  completions: 14
   parallelism: 10
-  backoffLimit: 3
+  backoffLimit: 6
   template:
     spec:
       restartPolicy: OnFailure
@@ -31,17 +31,6 @@ spec:
               pip install -q xarray netcdf4
 
               FILES=(
-                "2024/2024-07-d01-03-atmospheric.nc"
-                "2024/2024-07-d04-06-atmospheric.nc"
-                "2024/2024-07-d07-09-atmospheric.nc"
-                "2024/2024-07-d10-12-atmospheric.nc"
-                "2024/2024-07-d13-15-atmospheric.nc"
-                "2024/2024-07-d16-18-atmospheric.nc"
-                "2024/2024-07-d19-21-atmospheric.nc"
-                "2024/2024-07-d22-24-atmospheric.nc"
-                "2024/2024-07-d25-27-atmospheric.nc"
-                "2024/2024-07-d28-30-atmospheric.nc"
-                "2024/2024-07-d31-31-atmospheric.nc"
                 "2025/2025-06-d13-15-atmospheric.nc"
                 "2025/2025-06-d22-24-atmospheric.nc"
                 "2025/2025-06-d28-30-atmospheric.nc"
@@ -67,7 +56,7 @@ spec:
 
               mkdir -p "$(dirname "$DST_FILE")"
               mkdir -p /mnt/dst/logs
-              LOGFILE="/mnt/dst/logs/v4-$(echo "$FILE" | tr '/' '-').log"
+              LOGFILE="/mnt/dst/logs/v5-$(echo "$FILE" | tr '/' '-').log"
 
               echo "=== Pod index: $IDX ===" | tee "$LOGFILE"
               echo "File: $FILE" | tee -a "$LOGFILE"
