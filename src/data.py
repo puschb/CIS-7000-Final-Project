@@ -429,17 +429,29 @@ class ERA5Dataset(Dataset):
         return len(self.sequences)
 
     def _open_ds(self, path: Path) -> xr.Dataset:
-        """Return a cached xarray Dataset handle, opening the file only once."""
+        """Return a cached xarray Dataset handle (chunked layout only).
+
+        For per_timestep layout each file holds exactly one timestep, so
+        caching is not used — accumulating thousands of open Dataset objects
+        across a training run would balloon worker memory.
+        """
         if path not in self._ds_cache:
             self._ds_cache[path] = xr.open_dataset(path, engine="netcdf4")
         return self._ds_cache[path]
+
+    def _read_per_timestep(self, path: Path) -> xr.Dataset:
+        """Open a per-timestep NetCDF, read it fully into memory, and close it.
+
+        Returns an in-memory Dataset so the file handle is released immediately.
+        """
+        with xr.open_dataset(path, engine="netcdf4") as ds:
+            return ds.load()
 
     def _load_surface_raw(self, dt: datetime) -> dict[str, torch.Tensor]:
         """Load raw surface variables for a single timestamp (no density channels)."""
         if self.file_layout == "per_timestep":
             path = self.surf_paths_by_time[dt]
-            ds = self._open_ds(path)
-            sliced = ds.isel(valid_time=0)
+            sliced = self._read_per_timestep(path).isel(valid_time=0)
         else:
             key = (dt.year, dt.month)
             path = self.surface_files[key]
@@ -462,8 +474,7 @@ class ERA5Dataset(Dataset):
         """Load atmospheric variables for a single timestamp."""
         if self.file_layout == "per_timestep":
             path = self.atmos_paths_by_time[dt]
-            ds = self._open_ds(path)
-            sliced = ds.isel(valid_time=0)
+            sliced = self._read_per_timestep(path).isel(valid_time=0)
         else:
             info = _find_atmos_file(dt, self.atmos_chunks)
             assert info is not None, f"No atmospheric file covers {dt}"
