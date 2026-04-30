@@ -90,6 +90,7 @@ spec:
             --lr-new-embed    1e-3 \
             --weight-decay    5e-6 \
             --grad-clip       1.0 \
+            --val-every       300 \
             --n-val-samples   50 \
             --save-every      500 \
             --num-workers     8 \
