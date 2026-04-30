@@ -83,14 +83,13 @@ spec:
             --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 \
             --run-dir  /mnt/data/runs \
             --run-name "$RUN_NAME" \
-            --steps           3000 \
+            --epochs          6 \
             --rollout-steps   1 \
             --warmup-steps    500 \
             --lr-base         5e-5 \
             --lr-new-embed    1e-3 \
             --weight-decay    5e-6 \
             --grad-clip       1.0 \
-            --val-every       250 \
             --n-val-samples   50 \
             --save-every      500 \
             --num-workers     8 \

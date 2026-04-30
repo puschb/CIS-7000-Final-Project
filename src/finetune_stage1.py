@@ -351,15 +351,14 @@ def main() -> None:
     parser.add_argument("--data-dir",        nargs="+", required=True,        help="One or more dirs containing YYYY-MM-DDTHH-*.nc per-timestep files")
     parser.add_argument("--run-dir",         default="/mnt/data/runs",         help="Base directory on PVC for run artefacts")
     parser.add_argument("--run-name",        default=None,                     help="Sub-directory name (default: stage1_<timestamp>)")
-    parser.add_argument("--steps",           type=int,   default=3000)
+    parser.add_argument("--epochs",          type=int,   default=6,            help="Number of full passes over the training set")
     parser.add_argument("--rollout-steps",   type=int,   default=1,  choices=[1, 2])
     parser.add_argument("--warmup-steps",    type=int,   default=500)
     parser.add_argument("--lr-base",         type=float, default=5e-5,  help="LR for pretrained weights")
     parser.add_argument("--lr-new-embed",    type=float, default=1e-3,  help="LR for new variable patch embeddings")
     parser.add_argument("--weight-decay",    type=float, default=5e-6)
     parser.add_argument("--grad-clip",       type=float, default=1.0)
-    parser.add_argument("--val-every",       type=int,   default=250,  help="Validate every N training steps")
-    parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Random val samples per validation pass")
+    parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Val samples evaluated at the end of each epoch")
     parser.add_argument("--save-every",      type=int,   default=500,  help="Save periodic checkpoint every N steps")
     parser.add_argument("--num-workers",     type=int,   default=8)
     parser.add_argument("--prefetch-factor", type=int,   default=2)
@@ -381,16 +380,22 @@ def main() -> None:
         log.info(subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total",
                                           "--format=csv,noheader"]).decode().strip())
 
-    # ── Datasets & loaders ──────────────────────────────────────────────────
+    # ── Datasets ────────────────────────────────────────────────────────────
     log.info("Building datasets (per_timestep layout)...")
     train_ds, val_ds, _ = make_era5_splits(
         data_dirs=args.data_dir,
         rollout_steps=args.rollout_steps,
         file_layout="per_timestep",
     )
-    log.info(f"Train: {len(train_ds):,} samples | Val: {len(val_ds):,} samples")
+    total_steps = len(train_ds) * args.epochs
+    log.info(
+        f"Train: {len(train_ds):,} samples | Val: {len(val_ds):,} samples | "
+        f"Total steps: {total_steps:,} ({args.epochs} epochs)"
+    )
 
-    loader_kwargs = dict(
+    # Loaders are created fresh per epoch so train and val workers never
+    # coexist — they would otherwise compete for /dev/shm.
+    _loader_kwargs = dict(
         batch_size=1,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
@@ -399,8 +404,12 @@ def main() -> None:
         collate_fn=collate_era5_batch,
         pin_memory=(device.type == "cuda"),
     )
-    train_loader = DataLoader(train_ds, shuffle=True,  **loader_kwargs)
-    val_loader   = DataLoader(val_ds,   shuffle=True,  **loader_kwargs)
+
+    def _make_train_loader() -> DataLoader:
+        return DataLoader(train_ds, shuffle=True, **_loader_kwargs)
+
+    def _make_val_loader() -> DataLoader:
+        return DataLoader(val_ds, shuffle=True, **_loader_kwargs)
 
     # ── Model ───────────────────────────────────────────────────────────────
     log.info("Registering normalisation stats and building model...")
@@ -450,13 +459,13 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    # Linear warmup → cosine decay to 1e-5 (same shape for both param groups)
+    # Linear warmup → cosine decay to 1e-5 over the full training run.
     min_ratio = 1e-5 / args.lr_base
 
     def _lr_lambda(step: int) -> float:
         if step < args.warmup_steps:
             return step / max(1, args.warmup_steps)
-        progress = (step - args.warmup_steps) / max(1, args.steps - args.warmup_steps)
+        progress = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
         return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -465,134 +474,131 @@ def main() -> None:
 
     # ── Training loop ────────────────────────────────────────────────────────
     log.info(
-        f"\nStarting training: {args.steps} steps | rollout_steps={args.rollout_steps} | "
-        f"warmup={args.warmup_steps} | val_every={args.val_every} | "
-        f"train_samples={len(train_ds):,} (~{args.steps / len(train_ds):.1f} epochs)"
+        f"\nStarting training: {args.epochs} epochs × {len(train_ds):,} samples = "
+        f"{total_steps:,} steps | rollout_steps={args.rollout_steps} | "
+        f"warmup={args.warmup_steps} | val at end of each epoch"
     )
 
+    import gc
+
     best_val_loss = float("inf")
-    train_iter = iter(train_loader)
     step = 0
-    epoch = 0
-    samples_since_epoch_start = 0
-    # Rolling window for smoothed throughput (last 20 steps)
     _recent_step_times: list[float] = []
 
-    while step < args.steps:
-        # ── fetch batch (DataLoader / I/O time) ──────────────────────────────
-        t_io_start = time.time()
-        try:
-            input_batch, targets = next(train_iter)
-            samples_since_epoch_start += 1
-        except StopIteration:
-            epoch += 1
-            log.info(f"── Epoch {epoch} complete (step {step}) ──────────────────────────────")
-            train_iter = iter(train_loader)
-            input_batch, targets = next(train_iter)
-            samples_since_epoch_start = 1
-        t_io = time.time() - t_io_start
+    for epoch in range(1, args.epochs + 1):
+        log.info(f"── Epoch {epoch}/{args.epochs} ─────────────────────────────────────────")
 
-        input_batch = input_batch.to(device)
+        # Fresh train loader: workers start here, are killed at epoch end.
+        train_loader = _make_train_loader()
 
-        # ── forward / backward / optimizer (compute time) ────────────────────
-        t_compute_start = time.time()
-        optimizer.zero_grad()
-        current = input_batch
-        total_loss = torch.tensor(0.0, device=device)
-        rollout_records: list[dict] = []
+        for input_batch, targets in train_loader:
 
-        for target in targets:
-            target_gpu = target.to(device)
-            pred = model(current)
-            loss, per_var = weighted_mae_loss(pred, target_gpu, device)
-            total_loss = total_loss + loss / len(targets)
-            rollout_records.append(per_var)
-            if len(targets) > 1:
-                current = assemble_next_input(current, pred)
+            # ── fetch time is implicit in DataLoader; measure compute only ──
+            t_io_start = time.time()
+            input_batch = input_batch.to(device)
+            t_io = time.time() - t_io_start
 
-        # Single backward through all rollout steps so gradients flow through
-        # every forward pass (true multi-step backprop, not the pushforward trick).
-        total_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
-        scheduler.step()
-        if device.type == "cuda":
-            torch.cuda.synchronize()   # ensure compute time excludes async queuing
-        t_compute = time.time() - t_compute_start
+            # ── forward / backward / optimizer ───────────────────────────────
+            t_compute_start = time.time()
+            optimizer.zero_grad()
+            current = input_batch
+            total_loss_t = torch.tensor(0.0, device=device)
+            rollout_records: list[dict] = []
 
-        step += 1
-        step_time = t_io + t_compute
+            for target in targets:
+                target_gpu = target.to(device)
+                pred = model(current)
+                loss, per_var = weighted_mae_loss(pred, target_gpu, device)
+                total_loss_t = total_loss_t + loss / len(targets)
+                rollout_records.append(per_var)
+                if len(targets) > 1:
+                    current = assemble_next_input(current, pred)
 
-        # Smoothed throughput over last 20 steps
-        _recent_step_times.append(step_time)
-        if len(_recent_step_times) > 20:
-            _recent_step_times.pop(0)
-        samples_per_sec = 1.0 / (sum(_recent_step_times) / len(_recent_step_times))
+            total_loss_t.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_compute = time.time() - t_compute_start
 
-        lrs = [pg["lr"] for pg in optimizer.param_groups]
-        avg = _avg_per_var(rollout_records)
+            step += 1
+            step_time = t_io + t_compute
+            _recent_step_times.append(step_time)
+            if len(_recent_step_times) > 20:
+                _recent_step_times.pop(0)
+            samples_per_sec = 1.0 / (sum(_recent_step_times) / len(_recent_step_times))
+
+            lrs = [pg["lr"] for pg in optimizer.param_groups]
+            avg = _avg_per_var(rollout_records)
+
+            writer.log({
+                "phase":            "train",
+                "step":             step,
+                "epoch":            epoch,
+                **avg,
+                "grad_norm":        grad_norm.item(),
+                "lr_base":          lrs[0],
+                "lr_new_embed":     lrs[1],
+                "step_time_s":      step_time,
+                "io_time_s":        t_io,
+                "compute_time_s":   t_compute,
+                "samples_per_sec":  samples_per_sec,
+            })
+
+            if step % 10 == 0:
+                pct = 100.0 * step / total_steps
+                eta_s = (total_steps - step) * (sum(_recent_step_times) / len(_recent_step_times))
+                eta_min = eta_s / 60
+                log.info(
+                    f"[{pct:5.1f}%] step {step:>5}/{total_steps} ep{epoch} | "
+                    f"loss={avg['loss_total']:.4f} | "
+                    f"swvl1={avg.get('mae_swvl1', float('nan')):.4f} "
+                    f"stl1={avg.get('mae_stl1', float('nan')):.4f} "
+                    f"sd={avg.get('mae_sd', float('nan')):.4f} | "
+                    f"grad={grad_norm:.3f} lr={lrs[0]:.1e} | "
+                    f"io={t_io:.1f}s gpu={t_compute:.1f}s | "
+                    f"{samples_per_sec:.2f}samp/s ETA={eta_min:.0f}min"
+                )
+
+            # ── Periodic checkpoint ──────────────────────────────────────────
+            if step % args.save_every == 0:
+                ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step)
+                log.info(f"Saved periodic checkpoint: {ckpt}")
+
+        # ── End of epoch: kill train workers, validate, kill val workers ─────
+        del train_loader
+        gc.collect()
+        log.info(f"Epoch {epoch} done (step {step}) — train workers released. Running validation ({args.n_val_samples} samples)...")
+
+        val_loader = _make_val_loader()
+        val_metrics = validate(model, val_loader, args.n_val_samples, device, args.rollout_steps)
+        del val_loader
+        gc.collect()
+        log.info("Val workers released.")
 
         writer.log({
-            "phase":            "train",
-            "step":             step,
-            "epoch":            epoch,
-            **avg,
-            "grad_norm":        grad_norm.item(),
-            "lr_base":          lrs[0],
-            "lr_new_embed":     lrs[1],
-            "step_time_s":      step_time,
-            "io_time_s":        t_io,
-            "compute_time_s":   t_compute,
-            "samples_per_sec":  samples_per_sec,
+            "phase":     "val",
+            "step":      step,
+            "epoch":     epoch,
+            "n_samples": args.n_val_samples,
+            **val_metrics,
         })
+        writer.flush_summary()
 
-        if step % 10 == 0:
-            pct = 100.0 * step / args.steps
-            eta_s = (args.steps - step) * (sum(_recent_step_times) / len(_recent_step_times))
-            eta_min = eta_s / 60
-            log.info(
-                f"[{pct:5.1f}%] step {step:>5}/{args.steps} ep{epoch} | "
-                f"loss={avg['loss_total']:.4f} | "
-                f"swvl1={avg.get('mae_swvl1', float('nan')):.4f} "
-                f"stl1={avg.get('mae_stl1', float('nan')):.4f} "
-                f"sd={avg.get('mae_sd', float('nan')):.4f} | "
-                f"grad={grad_norm:.3f} lr={lrs[0]:.1e} | "
-                f"io={t_io:.1f}s gpu={t_compute:.1f}s | "
-                f"{samples_per_sec:.2f}samp/s ETA={eta_min:.0f}min"
-            )
+        val_loss = val_metrics.get("loss_total", float("inf"))
+        log.info(
+            f"  val loss={val_loss:.4f} | "
+            f"mae_swvl1={val_metrics.get('mae_swvl1', float('nan')):.4f} | "
+            f"mae_stl1={val_metrics.get('mae_stl1', float('nan')):.4f} | "
+            f"mae_sd={val_metrics.get('mae_sd', float('nan')):.4f} | "
+            f"mae_2t={val_metrics.get('mae_2t', float('nan')):.4f}"
+        )
 
-        # ── Validation ───────────────────────────────────────────────────────
-        if step % args.val_every == 0:
-            log.info(f"Running validation ({args.n_val_samples} samples)...")
-            val_metrics = validate(
-                model, val_loader, args.n_val_samples, device, args.rollout_steps
-            )
-            writer.log({
-                "phase":     "val",
-                "step":      step,
-                "n_samples": args.n_val_samples,
-                **val_metrics,
-            })
-            writer.flush_summary()
-
-            val_loss = val_metrics.get("loss_total", float("inf"))
-            log.info(
-                f"  val loss={val_loss:.4f} | "
-                f"mae_swvl1={val_metrics.get('mae_swvl1', float('nan')):.4f} | "
-                f"mae_stl1={val_metrics.get('mae_stl1', float('nan')):.4f} | "
-                f"mae_sd={val_metrics.get('mae_sd', float('nan')):.4f} | "
-                f"mae_2t={val_metrics.get('mae_2t', float('nan')):.4f}"
-            )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step, tag="best")
-                log.info(f"  ✓ New best val loss {best_val_loss:.4f} → {ckpt}")
-
-        # ── Periodic checkpoint ──────────────────────────────────────────────
-        if step % args.save_every == 0:
-            ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step)
-            log.info(f"Saved periodic checkpoint: {ckpt}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step, tag="best")
+            log.info(f"  ✓ New best val loss {best_val_loss:.4f} → {ckpt}")
 
     # ── End of training ──────────────────────────────────────────────────────
     save_checkpoint(run_dir, model, optimizer, scheduler, step, tag="final")
