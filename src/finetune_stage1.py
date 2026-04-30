@@ -358,7 +358,8 @@ def main() -> None:
     parser.add_argument("--lr-new-embed",    type=float, default=1e-3,  help="LR for new variable patch embeddings")
     parser.add_argument("--weight-decay",    type=float, default=5e-6)
     parser.add_argument("--grad-clip",       type=float, default=1.0)
-    parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Val samples evaluated at the end of each epoch")
+    parser.add_argument("--val-every",       type=int,   default=300,  help="Validate every N training steps (and always at epoch end)")
+    parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Val samples per validation pass")
     parser.add_argument("--save-every",      type=int,   default=500,  help="Save periodic checkpoint every N steps")
     parser.add_argument("--num-workers",     type=int,   default=8)
     parser.add_argument("--prefetch-factor", type=int,   default=2)
@@ -476,7 +477,7 @@ def main() -> None:
     log.info(
         f"\nStarting training: {args.epochs} epochs × {len(train_ds):,} samples = "
         f"{total_steps:,} steps | rollout_steps={args.rollout_steps} | "
-        f"warmup={args.warmup_steps} | val at end of each epoch"
+        f"warmup={args.warmup_steps} | val_every={args.val_every} steps + end of each epoch"
     )
 
     import gc
@@ -485,20 +486,58 @@ def main() -> None:
     step = 0
     _recent_step_times: list[float] = []
 
+    def _run_validation(label: str) -> None:
+        """Spin up val workers, validate, tear them down. Logs and checkpoints."""
+        nonlocal best_val_loss
+        log.info(f"{label} — releasing train workers, running validation ({args.n_val_samples} samples)...")
+        val_loader = _make_val_loader()
+        val_metrics = validate(model, val_loader, args.n_val_samples, device, args.rollout_steps)
+        del val_loader
+        gc.collect()
+        log.info("Val workers released.")
+
+        writer.log({
+            "phase":     "val",
+            "step":      step,
+            "epoch":     epoch,
+            "n_samples": args.n_val_samples,
+            **val_metrics,
+        })
+        writer.flush_summary()
+
+        val_loss = val_metrics.get("loss_total", float("inf"))
+        log.info(
+            f"  val loss={val_loss:.4f} | "
+            f"mae_swvl1={val_metrics.get('mae_swvl1', float('nan')):.4f} | "
+            f"mae_stl1={val_metrics.get('mae_stl1', float('nan')):.4f} | "
+            f"mae_sd={val_metrics.get('mae_sd', float('nan')):.4f} | "
+            f"mae_2t={val_metrics.get('mae_2t', float('nan')):.4f}"
+        )
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step, tag="best")
+            log.info(f"  ✓ New best val loss {best_val_loss:.4f} → {ckpt}")
+
     for epoch in range(1, args.epochs + 1):
         log.info(f"── Epoch {epoch}/{args.epochs} ─────────────────────────────────────────")
 
-        # Fresh train loader: workers start here, are killed at epoch end.
+        # Fresh train loader for this epoch.  We use next() manually so we can
+        # pause mid-epoch for validation without keeping both loaders alive.
         train_loader = _make_train_loader()
+        train_iter   = iter(train_loader)
+        mid_val_done_at = None   # track last mid-epoch val step to avoid double-val at epoch end
 
-        for input_batch, targets in train_loader:
+        while True:
+            try:
+                input_batch, targets = next(train_iter)
+            except StopIteration:
+                break  # epoch exhausted
 
-            # ── fetch time is implicit in DataLoader; measure compute only ──
+            # ── forward / backward / optimizer ───────────────────────────────
             t_io_start = time.time()
             input_batch = input_batch.to(device)
             t_io = time.time() - t_io_start
 
-            # ── forward / backward / optimizer ───────────────────────────────
             t_compute_start = time.time()
             optimizer.zero_grad()
             current = input_batch
@@ -566,39 +605,22 @@ def main() -> None:
                 ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step)
                 log.info(f"Saved periodic checkpoint: {ckpt}")
 
-        # ── End of epoch: kill train workers, validate, kill val workers ─────
-        del train_loader
+            # ── Mid-epoch validation ─────────────────────────────────────────
+            # Kill train workers, validate, recreate train loader to continue.
+            if step % args.val_every == 0:
+                mid_val_done_at = step
+                del train_iter, train_loader
+                gc.collect()
+                _run_validation(f"Step {step}")
+                train_loader = _make_train_loader()
+                train_iter   = iter(train_loader)
+
+        # ── End of epoch ─────────────────────────────────────────────────────
+        del train_iter, train_loader
         gc.collect()
-        log.info(f"Epoch {epoch} done (step {step}) — train workers released. Running validation ({args.n_val_samples} samples)...")
-
-        val_loader = _make_val_loader()
-        val_metrics = validate(model, val_loader, args.n_val_samples, device, args.rollout_steps)
-        del val_loader
-        gc.collect()
-        log.info("Val workers released.")
-
-        writer.log({
-            "phase":     "val",
-            "step":      step,
-            "epoch":     epoch,
-            "n_samples": args.n_val_samples,
-            **val_metrics,
-        })
-        writer.flush_summary()
-
-        val_loss = val_metrics.get("loss_total", float("inf"))
-        log.info(
-            f"  val loss={val_loss:.4f} | "
-            f"mae_swvl1={val_metrics.get('mae_swvl1', float('nan')):.4f} | "
-            f"mae_stl1={val_metrics.get('mae_stl1', float('nan')):.4f} | "
-            f"mae_sd={val_metrics.get('mae_sd', float('nan')):.4f} | "
-            f"mae_2t={val_metrics.get('mae_2t', float('nan')):.4f}"
-        )
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            ckpt = save_checkpoint(run_dir, model, optimizer, scheduler, step, tag="best")
-            log.info(f"  ✓ New best val loss {best_val_loss:.4f} → {ckpt}")
+        # Skip end-of-epoch val if we just ran one on the very last step.
+        if mid_val_done_at != step:
+            _run_validation(f"Epoch {epoch} end (step {step})")
 
     # ── End of training ──────────────────────────────────────────────────────
     save_checkpoint(run_dir, model, optimizer, scheduler, step, tag="final")
