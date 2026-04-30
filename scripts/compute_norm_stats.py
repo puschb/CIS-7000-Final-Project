@@ -10,6 +10,21 @@ to avoid data leakage from val/test.
 
 Uses Welford's online algorithm so the full dataset never needs to fit in memory.
 
+**Where the metrics live**
+
+The script does **not** write a file. It prints mean/std to stdout (e.g. ``kubectl logs
+job/compute-norm-stats``). You copy the printed ``_NEW_VAR_NORM`` block into
+``src/finetune.py``. That dict is the persistent source of truth in git.
+
+**How they are used**
+
+Before constructing the model, ``src/finetune._register_new_var_normalisation()``
+writes each ``(mean, std)`` into ``aurora.normalisation.locations`` and
+``aurora.normalisation.scales`` (module-level dicts shipped with ``microsoft-aurora``).
+Aurora's forward pass reads those globals to normalize inputs and unnormalize
+outputs for each surface variable. Density channels (``*_density``) are registered
+separately in code (mean 0, std 1) and are not produced by this script.
+
 Usage:
     python -u scripts/compute_norm_stats.py \
         --data-dir /mnt/data/era5/2024 /mnt/data/era5/2025

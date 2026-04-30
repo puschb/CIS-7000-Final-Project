@@ -44,8 +44,8 @@ kubectl logs -f job/compute-norm-stats
 ```
 
 This runs `scripts/compute_norm_stats.py`, which:
-1. Scans all `*-surface.nc` files in the data directories
-2. Filters to only timestamps within the training date ranges
+1. Opens monthly `YYYY-MM-surface.nc` files under each `--data-dir` (Jun+Jul only, training split)
+2. For each timestep in range, loads one slab at a time (no full-month RAM spike)
 3. Computes global mean and std using Welford's online algorithm (memory-efficient)
 4. Prints output ready to paste into `src/finetune.py`
 
@@ -58,6 +58,17 @@ _NEW_VAR_NORM: dict[str, tuple[float, float]] = {
     "sd": (<mean>, <std>),
 }
 ```
+
+### Where stats are stored and how they are used
+
+| Stage | What happens |
+| --- | --- |
+| **Job output** | Stats exist only in **stdout** (container logs). The script does not write JSON or NetCDF. Redirect or copy from logs if you want an offline backup. |
+| **Repo / training** | The values you care about for reproducibility live in **`src/finetune.py`** as `_NEW_VAR_NORM` (or the same pattern in a future Stage-1 script once it exists). |
+| **At runtime** | `main()` calls `_register_new_var_normalisation()` **before** `AuroraPretrained(...)`. That function mutates Aurora's module-level `locations` and `scales` from `aurora.normalisation` so each new variable has a `(mean, std)` pair. |
+| **Inside the model** | Aurora normalizes inputs with those centers/scales and applies the inverse when decoding predictions, consistent with the pretrained ERA5 variables. Your `Batch` tensors passed in should still be **raw physical units**; normalization is internal to the model. |
+
+Density channels (`swvl1_density`, etc.) use fixed `(0, 1)` in code, not values from this job.
 
 ---
 

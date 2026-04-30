@@ -8,4 +8,5 @@ spec:
     - ReadWriteMany
   resources:
     requests:
-      storage: 250Gi
+      # Expanded from 250Gi after rechunk job filled the volume; rook-cephfs allows expansion.
+      storage: 700Gi

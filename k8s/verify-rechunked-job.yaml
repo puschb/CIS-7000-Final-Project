@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-rechunked-era5
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                - us-west
+      containers:
+        - name: verify
+          image: python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              pip install -q xarray netcdf4 numpy
+              python3 -u /scripts/verify_rechunked_era5.py \
+                --src-root /mnt/src/era5 \
+                --dst-root /mnt/dst/era5 \
+                --check-chunks \
+                --quick
+          volumeMounts:
+            - name: src
+              mountPath: /mnt/src
+              readOnly: true
+            - name: dst
+              mountPath: /mnt/dst
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: "16Gi"
+            limits:
+              cpu: "2"
+              memory: "16Gi"
+      volumes:
+        - name: src
+          persistentVolumeClaim:
+            claimName: era5-summer-data-many-connect
+        - name: dst
+          persistentVolumeClaim:
+            claimName: era5-rechunked
+        - name: scripts
+          configMap:
+            name: verify-rechunk-era5

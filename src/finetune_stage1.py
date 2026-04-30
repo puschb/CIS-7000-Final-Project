@@ -162,6 +162,16 @@ class MetricsWriter:
 # Loss and per-variable metrics
 # ---------------------------------------------------------------------------
 
+def _trim_to_pred(p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Trim target spatial dims to match prediction.
+
+    Aurora internally crops latitude from 721 → 720 (patch size 4 requires
+    dimensions divisible by 4). Trim the last two dims of t to p's shape so
+    the loss comparison is valid.
+    """
+    return t[..., : p.shape[-2], : p.shape[-1]]
+
+
 def weighted_mae_loss(
     pred: Batch,
     target: Batch,
@@ -185,12 +195,14 @@ def weighted_mae_loss(
     for var, p in pred.surf_vars.items():
         t = target.surf_vars[var]
         t = t[:, -1:] if t.shape[1] > 1 else t
+        t = _trim_to_pred(p, t)
 
         if var in DENSITY_VARS:
             density_key = f"{var}_density"
             if density_key in target.surf_vars:
                 d = target.surf_vars[density_key]
                 d = d[:, -1:] if d.shape[1] > 1 else d
+                d = _trim_to_pred(p, d)
                 mask = (d >= 0.5).expand_as(p)
                 mae = F.l1_loss(p[mask], t[mask]) if mask.any() else torch.tensor(0.0, device=device)
             else:
@@ -206,9 +218,11 @@ def weighted_mae_loss(
     for var, p in pred.atmos_vars.items():
         t = target.atmos_vars[var]
         t = t[:, -1:] if t.shape[1] > 1 else t
+        t = _trim_to_pred(p, t)
 
-        # Per pressure-level MAE
-        for i, lvl in enumerate(PRESSURE_LEVELS):
+        # Per pressure-level MAE (use only levels present in the prediction)
+        n_levels = p.shape[2]
+        for i, lvl in enumerate(PRESSURE_LEVELS[:n_levels]):
             per_var[f"mae_{var}_{lvl}"] = F.l1_loss(p[:, :, i], t[:, :, i]).item()
 
         # Average over all levels (used in the weighted loss)
