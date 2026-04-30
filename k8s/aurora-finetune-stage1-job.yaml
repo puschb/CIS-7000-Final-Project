@@ -4,7 +4,7 @@
 #   - 8 CPUs  (one per DataLoader worker; main process is light)
 #   - 64 Gi RAM  (workers + prefetch=2 queues + model; 48 Gi was OOMKilled before
 #     the per_timestep xarray cache fix; 64 Gi leaves headroom with prefetch=2)
-#   - 16 Gi /dev/shm  (PyTorch shared-memory IPC; ~8 workers × prefetch 2 × ~1 GB)
+#   - 24 Gi /dev/shm  (PyTorch shared-memory IPC between workers and main process)
 #   - 1× 48 GB GPU (L40, L40S, or RTX-A6000)
 #
 # Usage:
@@ -120,5 +120,5 @@ spec:
       - name: shm
         emptyDir:
           medium: Memory
-          sizeLimit: 16Gi
+          sizeLimit: 24Gi
       restartPolicy: Never
