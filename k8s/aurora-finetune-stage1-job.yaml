@@ -92,8 +92,8 @@ spec:
             --val-every       250 \
             --n-val-samples   50 \
             --save-every      500 \
-            --num-workers     12 \
-            --prefetch-factor 2
+            --num-workers     8 \
+            --prefetch-factor 1
         volumeMounts:
         - name: repo
           mountPath: /opt/repo
@@ -119,5 +119,5 @@ spec:
       - name: shm
         emptyDir:
           medium: Memory
-          sizeLimit: 24Gi
+          sizeLimit: 8Gi
       restartPolicy: Never
