@@ -361,7 +361,7 @@ def main() -> None:
     parser.add_argument("--val-every",       type=int,   default=250,  help="Validate every N training steps")
     parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Random val samples per validation pass")
     parser.add_argument("--save-every",      type=int,   default=500,  help="Save periodic checkpoint every N steps")
-    parser.add_argument("--num-workers",     type=int,   default=12)
+    parser.add_argument("--num-workers",     type=int,   default=8)
     parser.add_argument("--prefetch-factor", type=int,   default=2)
     args = parser.parse_args()
 
