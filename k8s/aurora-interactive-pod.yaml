@@ -37,6 +37,7 @@ spec:
                 - NVIDIA-L40
                 - NVIDIA-L40S
                 - NVIDIA-RTX-A6000
+                - NVIDIA-A40
       initContainers:
       - name: clone-repo
         image: alpine/git
