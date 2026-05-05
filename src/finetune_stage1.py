@@ -311,32 +311,60 @@ def save_checkpoint(
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
-    val_loader: DataLoader,
+    val_ds,
     n_samples: int,
     device: torch.device,
 ) -> dict[str, float]:
-    """Run validation on n_samples from val_loader.
+    """Run validation on n_samples drawn freshly from val_ds.
 
-    val_loader must use num_workers=0 so it doesn't compete with the
-    train loader for /dev/shm.
+    A new DataLoader is built each call (persistent_workers=False) so its
+    workers are guaranteed to be dead — and their /dev/shm allocations
+    released — before this function returns.  The iterator is explicitly
+    deleted in the finally block rather than relying on GC timing.
+
+    Peak shm during validation:
+      train workers (full queue, main process busy): 8 × 2 × ~900 MB = 14.4 GB
+      val workers (4 × prefetch 2):                  4 × 2 × ~900 MB =  7.2 GB
+      total: ~21.6 GB  (fits in 24 Gi)
+    After validate() returns: val workers are dead, shm drops back to 14.4 GB.
     """
     model.eval()
     accum: list[dict[str, float]] = []
 
-    for input_batch, targets in itertools.islice(val_loader, n_samples):
-        input_batch = input_batch.to(device)
-        current = input_batch
-        step_records: list[dict] = []
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=True,
+        num_workers=4,
+        prefetch_factor=2,
+        persistent_workers=False,
+        worker_init_fn=era5_worker_init_fn,
+        collate_fn=collate_era5_batch,
+    )
+    val_iter = iter(val_loader)
+    try:
+        for _ in range(n_samples):
+            try:
+                input_batch, targets = next(val_iter)
+            except StopIteration:
+                break
 
-        for target in targets:
-            target_gpu = target.to(device)
-            pred = model(current)
-            _, per_var = weighted_mae_loss(pred, target_gpu, device)
-            step_records.append(per_var)
-            if len(targets) > 1:
-                current = assemble_next_input(current, pred)
+            input_batch = input_batch.to(device)
+            current = input_batch
+            step_records: list[dict] = []
 
-        accum.append(_avg_per_var(step_records))
+            for target in targets:
+                target_gpu = target.to(device)
+                pred = model(current)
+                _, per_var = weighted_mae_loss(pred, target_gpu, device)
+                step_records.append(per_var)
+                if len(targets) > 1:
+                    current = assemble_next_input(current, pred)
+
+            accum.append(_avg_per_var(step_records))
+    finally:
+        del val_iter   # shuts down workers synchronously before we return
+        del val_loader
 
     model.train()
 
@@ -408,17 +436,7 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # Validation loader: num_workers=0 so it runs in the main process with zero
-    # /dev/shm usage and never competes with the train loader's 8 workers.
-    # shuffle=True gives a different random slice of val_ds each validation pass.
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_era5_batch,
-    )
-    log.info(f"Val loader ready (num_workers=0, {len(val_ds):,} samples, using {args.n_val_samples} per pass)")
+    log.info(f"Val dataset ready ({len(val_ds):,} samples, {args.n_val_samples} used per pass with 4 workers)")
 
     # ── Model ───────────────────────────────────────────────────────────────
     log.info("Registering normalisation stats and building model...")
@@ -581,8 +599,8 @@ def main() -> None:
 
         # ── Validation ───────────────────────────────────────────────────────
         if step % args.val_every == 0:
-            log.info(f"Running validation ({args.n_val_samples} samples, num_workers=0)...")
-            val_metrics = validate(model, val_loader, args.n_val_samples, device)
+            log.info(f"Running validation ({args.n_val_samples} samples, 4 workers)...")
+            val_metrics = validate(model, val_ds, args.n_val_samples, device)
             writer.log({
                 "phase":     "val",
                 "step":      step,

@@ -1,12 +1,13 @@
-# Interactive GPU pod for Stage 1 fine-tuning development.
+# Interactive GPU job for Stage 1 fine-tuning development.
 #
-# Same resources as aurora-finetune-stage1-job.yaml so you can run, edit,
-# and rerun the training script without the pod dying on you.
+# Runs as a Job (required by Nautilus for >32 Gi RAM) with "sleep infinity"
+# so the pod stays alive. Exec into it to run/rerun the training script.
 #
 # Usage:
 #   kubectl -n upenn-dyer-lab create -f k8s/aurora-interactive-pod.yaml
-#   kubectl -n upenn-dyer-lab exec -it aurora-interactive -- /bin/bash
-#   kubectl -n upenn-dyer-lab delete pod aurora-interactive
+#   kubectl -n upenn-dyer-lab get pods   # wait for Running
+#   kubectl -n upenn-dyer-lab exec -it <pod-name> -- /bin/bash
+#   kubectl -n upenn-dyer-lab delete job aurora-interactive
 #
 # Inside the pod:
 #   cd /opt/repo && git pull   # pull latest code changes
@@ -17,85 +18,86 @@
 #     --run-dir  /mnt/data/runs \
 #     --epochs 6 --rollout-steps 1 --val-every 300 --n-val-samples 50 \
 #     --num-workers 8 --prefetch-factor 2
-apiVersion: v1
-kind: Pod
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: aurora-interactive
 spec:
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: nvidia.com/gpu.product
-            operator: In
-            values:
-            - NVIDIA-L40
-            - NVIDIA-L40S
-            - NVIDIA-RTX-A6000
-  initContainers:
-  - name: clone-repo
-    image: alpine/git
-    env:
-    - name: GIT_USERNAME
-      valueFrom:
-        secretKeyRef:
-          name: github-secret
-          key: user
-    - name: GIT_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: github-secret
-          key: password
-    args:
-    - clone
-    - --single-branch
-    - --depth=1
-    - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
-    - /opt/repo
-    volumeMounts:
-    - name: repo
-      mountPath: /opt/repo
-    resources:
-      requests:
-        cpu: "500m"
-        memory: "512Mi"
-      limits:
-        cpu: "500m"
-        memory: "512Mi"
-  containers:
-  - name: aurora-interactive
-    image: puschb/aurora-dev:latest
-    stdin: true
-    tty: true
-    command: ["/bin/bash"]
-    env:
-    - name: PYTORCH_CUDA_ALLOC_CONF
-      value: "backend:cudaMallocAsync"
-    volumeMounts:
-    - name: repo
-      mountPath: /opt/repo
-    - name: data
-      mountPath: /mnt/data
-    - name: shm
-      mountPath: /dev/shm
-    resources:
-      requests:
-        memory: 64Gi
-        cpu: "8"
-        nvidia.com/gpu: "1"
-      limits:
-        memory: 64Gi
-        cpu: "8"
-        nvidia.com/gpu: "1"
-  volumes:
-  - name: repo
-    emptyDir: {}
-  - name: data
-    persistentVolumeClaim:
-      claimName: era5-rechunked
-  - name: shm
-    emptyDir:
-      medium: Memory
-      sizeLimit: 24Gi
-  restartPolicy: Never
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-L40
+                - NVIDIA-L40S
+                - NVIDIA-RTX-A6000
+      initContainers:
+      - name: clone-repo
+        image: alpine/git
+        env:
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: user
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: github-secret
+              key: password
+        args:
+        - clone
+        - --single-branch
+        - --depth=1
+        - https://$(GIT_USERNAME):$(GIT_PASSWORD)@github.com/puschb/CIS-7000-Final-Project.git
+        - /opt/repo
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      containers:
+      - name: aurora-interactive
+        image: puschb/aurora-dev:latest
+        command: ["sleep", "infinity"]
+        env:
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "backend:cudaMallocAsync"
+        volumeMounts:
+        - name: repo
+          mountPath: /opt/repo
+        - name: data
+          mountPath: /mnt/data
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            memory: 64Gi
+            cpu: "8"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: 64Gi
+            cpu: "8"
+            nvidia.com/gpu: "1"
+      volumes:
+      - name: repo
+        emptyDir: {}
+      - name: data
+        persistentVolumeClaim:
+          claimName: era5-rechunked
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 24Gi
+      restartPolicy: Never
