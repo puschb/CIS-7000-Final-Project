@@ -1,14 +1,26 @@
-# GPU interactive pod (L40 48GB) for development.
-# Clones repo at startup, drops you into a shell with everything ready.
+# Interactive GPU pod for Stage 1 fine-tuning development.
+#
+# Same resources as aurora-finetune-stage1-job.yaml so you can run, edit,
+# and rerun the training script without the pod dying on you.
 #
 # Usage:
-#   kubectl create -f k8s/aurora-interactive-pod.yaml
-#   kubectl exec -it aurora-dev -- /bin/bash
-#   kubectl delete pod aurora-dev
+#   kubectl -n upenn-dyer-lab create -f k8s/aurora-interactive-pod.yaml
+#   kubectl -n upenn-dyer-lab exec -it aurora-interactive -- /bin/bash
+#   kubectl -n upenn-dyer-lab delete pod aurora-interactive
+#
+# Inside the pod:
+#   cd /opt/repo && git pull   # pull latest code changes
+#   export PYTHONPATH=/opt/repo
+#   export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
+#   python -u -m src.finetune_stage1 \
+#     --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 \
+#     --run-dir  /mnt/data/runs \
+#     --epochs 6 --rollout-steps 1 --val-every 300 --n-val-samples 50 \
+#     --num-workers 8 --prefetch-factor 2
 apiVersion: v1
 kind: Pod
 metadata:
-  name: aurora-dev
+  name: aurora-interactive
 spec:
   affinity:
     nodeAffinity:
@@ -19,6 +31,8 @@ spec:
             operator: In
             values:
             - NVIDIA-L40
+            - NVIDIA-L40S
+            - NVIDIA-RTX-A6000
   initContainers:
   - name: clone-repo
     image: alpine/git
@@ -42,34 +56,37 @@ spec:
     volumeMounts:
     - name: repo
       mountPath: /opt/repo
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
   containers:
-  - name: aurora-dev
+  - name: aurora-interactive
     image: puschb/aurora-dev:latest
-    command: ["sh", "-c", "echo \"url: $CDS_URL\nkey: $CDS_KEY\" > ~/.cdsapirc && cd /opt/repo && echo 'Ready — repo cloned, aurora installed.' && sleep infinity"]
+    stdin: true
+    tty: true
+    command: ["/bin/bash"]
     env:
-    - name: CDS_URL
-      valueFrom:
-        secretKeyRef:
-          name: cds-api-key
-          key: url
-    - name: CDS_KEY
-      valueFrom:
-        secretKeyRef:
-          name: cds-api-key
-          key: key
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: "backend:cudaMallocAsync"
     volumeMounts:
     - name: repo
       mountPath: /opt/repo
     - name: data
       mountPath: /mnt/data
+    - name: shm
+      mountPath: /dev/shm
     resources:
       requests:
-        memory: 32Gi
-        cpu: "4"
+        memory: 64Gi
+        cpu: "8"
         nvidia.com/gpu: "1"
       limits:
-        memory: 32Gi
-        cpu: "4"
+        memory: 64Gi
+        cpu: "8"
         nvidia.com/gpu: "1"
   volumes:
   - name: repo
@@ -77,4 +94,8 @@ spec:
   - name: data
     persistentVolumeClaim:
       claimName: era5-rechunked
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 24Gi
   restartPolicy: Never
