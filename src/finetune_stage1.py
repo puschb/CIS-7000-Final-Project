@@ -22,7 +22,7 @@ Usage:
     python -m src.finetune_stage1 \\
         --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 \\
         --run-dir /mnt/data/runs \\
-        --steps 3000 --rollout-steps 1
+        --epochs 6 --rollout-steps 1
 """
 
 from __future__ import annotations
@@ -305,51 +305,25 @@ def save_checkpoint(
 
 
 # ---------------------------------------------------------------------------
-# Validation cache
-# ---------------------------------------------------------------------------
-
-def build_val_cache(
-    val_ds,
-    n_samples: int,
-    rollout_steps: int,
-    log: logging.Logger,
-) -> list[tuple]:
-    """Load n_samples from val_ds into CPU RAM at startup.
-
-    Returns a list of (input_batch, targets) tuples.  Loading happens
-    synchronously in the main process — no DataLoader workers needed,
-    so it never touches /dev/shm and doesn't compete with the train loader.
-    """
-    indices = list(range(len(val_ds)))
-    import random
-    random.seed(42)
-    random.shuffle(indices)
-    chosen = indices[:n_samples]
-
-    cache: list[tuple] = []
-    for i, idx in enumerate(chosen):
-        sample = val_ds[idx]
-        cache.append(sample)
-        if (i + 1) % 10 == 0 or (i + 1) == len(chosen):
-            log.info(f"  Pre-loaded val sample {i + 1}/{len(chosen)}")
-    return cache
-
-
-# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
-    val_cache: list[tuple],
+    val_loader: DataLoader,
+    n_samples: int,
     device: torch.device,
 ) -> dict[str, float]:
-    """Run validation on the pre-cached val samples."""
+    """Run validation on n_samples from val_loader.
+
+    val_loader must use num_workers=0 so it doesn't compete with the
+    train loader for /dev/shm.
+    """
     model.eval()
     accum: list[dict[str, float]] = []
 
-    for input_batch, targets in val_cache:
+    for input_batch, targets in itertools.islice(val_loader, n_samples):
         input_batch = input_batch.to(device)
         current = input_batch
         step_records: list[dict] = []
@@ -388,7 +362,7 @@ def main() -> None:
     parser.add_argument("--weight-decay",    type=float, default=5e-6)
     parser.add_argument("--grad-clip",       type=float, default=1.0)
     parser.add_argument("--val-every",       type=int,   default=300,  help="Validate every N training steps")
-    parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Val samples to pre-cache at startup")
+    parser.add_argument("--n-val-samples",   type=int,   default=50,   help="Number of val samples to evaluate per validation pass")
     parser.add_argument("--save-every",      type=int,   default=500,  help="Save periodic checkpoint every N steps")
     parser.add_argument("--num-workers",     type=int,   default=8)
     parser.add_argument("--prefetch-factor", type=int,   default=2)
@@ -434,10 +408,17 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # Pre-cache val samples into CPU RAM — no DataLoader workers, no /dev/shm pressure.
-    log.info(f"Pre-caching {args.n_val_samples} val samples into RAM...")
-    val_cache = build_val_cache(val_ds, args.n_val_samples, args.rollout_steps, log)
-    log.info(f"Val cache ready: {len(val_cache)} samples")
+    # Validation loader: num_workers=0 so it runs in the main process with zero
+    # /dev/shm usage and never competes with the train loader's 8 workers.
+    # shuffle=True gives a different random slice of val_ds each validation pass.
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_era5_batch,
+    )
+    log.info(f"Val loader ready (num_workers=0, {len(val_ds):,} samples, using {args.n_val_samples} per pass)")
 
     # ── Model ───────────────────────────────────────────────────────────────
     log.info("Registering normalisation stats and building model...")
@@ -600,8 +581,8 @@ def main() -> None:
 
         # ── Validation ───────────────────────────────────────────────────────
         if step % args.val_every == 0:
-            log.info(f"Running validation ({len(val_cache)} cached samples)...")
-            val_metrics = validate(model, val_cache, device)
+            log.info(f"Running validation ({args.n_val_samples} samples, num_workers=0)...")
+            val_metrics = validate(model, val_loader, args.n_val_samples, device)
             writer.log({
                 "phase":     "val",
                 "step":      step,
