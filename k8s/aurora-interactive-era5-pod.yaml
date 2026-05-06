@@ -11,7 +11,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: aurora-dev-era5
+  name: aurora-dev-era5-reduced
 spec:
   affinity:
     nodeAffinity:
@@ -26,6 +26,10 @@ spec:
             - NVIDIA-L40
             - NVIDIA-L40S
             - NVIDIA-A100-SXM4-80GB
+          - key: kubernetes.io/hostname
+            operator: NotIn
+            values:
+            - rci-tide-gpu-03.sdsu.edu
   initContainers:
   - name: clone-repo
     image: alpine/git
@@ -72,16 +76,16 @@ spec:
     resources:
       requests:
         memory: 32Gi
-        cpu: "4"
+        cpu: "2"
         nvidia.com/gpu: "1"
       limits:
         memory: 32Gi
-        cpu: "4"
+        cpu: "2"
         nvidia.com/gpu: "1"
   volumes:
   - name: repo
     emptyDir: {}
   - name: era5-data
     persistentVolumeClaim:
-      claimName: era5-rechunked
+      claimName: era5-summer-data-many-connect
   restartPolicy: Never

@@ -1,6 +1,6 @@
 """Stage 1 short-lead-time fine-tuning: AuroraSmallPretrained + soil moisture variables.
 
-Trains the full model (no LoRA) on 1–2 autoregressive steps with a weighted MAE loss
+Trains the full model (no LoRA) on 112 autoregressive steps with a weighted MAE loss
 following the HRES-WAM fine-tuning pattern from the Aurora paper (Sections D.1, D.3).
 
 All artefacts land under --run-dir/<run-name>/:
