@@ -1,23 +1,13 @@
-"""Stage 1 feature extraction for the linear-probe hydrology baseline.
+"""Extract frozen Aurora surface latents for the hydrology linear probe.
 
-This script runs frozen Aurora on atmospheric inputs only, taps the surface
-latent right before an existing surface head (preferably the `2t` head), and
-writes one `(latent, targets)` sample per timestamp to disk.
+This follows the same data path as Stage 1 fine-tuning:
+  - per-timestep ERA5 files under ``/mnt/data/era5/per-step/{2024,2025}``
+  - default train / val / test splits from ``src.data.make_era5_splits``
+  - multi-worker DataLoader with the same worker-init / collate helpers
 
-Default split logic follows `docs/preprocessing_and_splits.md`:
-  - train: Jun 1 - Aug 1 for 2024 and 2025
-  - val:   Aug 1 - Aug 16 for 2024 and 2025
-  - test:  Aug 16 - Sep 1 for 2024 and 2025
-
-Each saved sample contains:
-  - `latent`:   `(1, Hp, Wp, D)` surface latent in bf16 by default
-  - `targets`:  `(3, H, W)` future `{swvl1, stl1, sd}` at `t+6h`
-  - `source_time`: current Aurora input time `t`
-  - `target_time`: future hydrology time `t+6h`
-  - `year`: data directory year inferred from the path
-  - `split`: train / val / test
-
-Shared metadata is saved once to `<output-dir>/metadata.pt`.
+Aurora itself still receives only its pretrained surface inputs
+(`2t`, `10u`, `10v`, `msl`). The future hydrology fields
+(`swvl1`, `stl1`, `sd`) are saved only as targets for the linear probe.
 """
 
 from __future__ import annotations
@@ -26,12 +16,12 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
 
 from aurora import AuroraPretrained, AuroraSmallPretrained
 
@@ -39,32 +29,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.data import BASE_SURF_VAR_NAMES, ERA5Dataset
+from src.data import (
+    BASE_SURF_VAR_NAMES,
+    MultiRangeERA5Dataset,
+    collate_era5_batch,
+    era5_worker_init_fn,
+    make_era5_splits,
+)
 
 DEFAULT_TARGET_VARS = ("swvl1", "stl1", "sd")
-DEFAULT_SPLIT_RANGES = {
-    "train": ((6, 1, 8, 1),),
-    "val": ((8, 1, 8, 16),),
-    "test": ((8, 16, 9, 1),),
-}
-
-
-@dataclass(frozen=True)
-class RangeSpec:
-    year: int
-    start: datetime
-    end: datetime
-    split: str
-    data_dir: Path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract Aurora surface latents for linear probing")
     parser.add_argument(
         "--data-dir",
-        action="append",
+        nargs="+",
         required=True,
-        help="ERA5 year directory. Pass once per year, e.g. /mnt/data/era5/2024",
+        help="One or more ERA5 year directories, e.g. /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025",
     )
     parser.add_argument(
         "--split",
@@ -90,6 +72,18 @@ def parse_args() -> argparse.Namespace:
         help="Future surface variables to save as targets.",
     )
     parser.add_argument("--step-hours", type=int, default=6)
+    parser.add_argument(
+        "--file-layout",
+        choices=["per_timestep", "chunked"],
+        default="per_timestep",
+        help="Use the same per-step layout as Stage 1 by default.",
+    )
+    parser.add_argument(
+        "--static-path",
+        type=Path,
+        default=None,
+        help="Optional explicit path to static.nc if it is not inside each year directory.",
+    )
     parser.add_argument("--small", action="store_true", help="Use AuroraSmallPretrained")
     parser.add_argument(
         "--device",
@@ -107,6 +101,8 @@ def parse_args() -> argparse.Namespace:
         help="Explicit named_modules path for the hooked surface head. If omitted, autodiscover.",
     )
     parser.add_argument("--patch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--latent-dtype",
         choices=["bf16", "fp16", "fp32"],
@@ -134,35 +130,8 @@ def storage_dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def infer_year(data_dir: Path) -> int:
-    try:
-        return int(data_dir.name)
-    except ValueError as exc:
-        raise ValueError(f"Could not infer year from data dir {data_dir}") from exc
-
-
-def build_default_ranges(data_dirs: list[Path], splits: list[str]) -> list[RangeSpec]:
-    specs: list[RangeSpec] = []
-    for data_dir in data_dirs:
-        year = infer_year(data_dir)
-        for split in splits:
-            for start_month, start_day, end_month, end_day in DEFAULT_SPLIT_RANGES[split]:
-                specs.append(
-                    RangeSpec(
-                        year=year,
-                        start=datetime(year, start_month, start_day),
-                        end=datetime(year, end_month, end_day),
-                        split=split,
-                        data_dir=data_dir,
-                    )
-                )
-    return specs
-
-
-def build_custom_ranges(data_dirs: list[Path], specs_raw: list[str]) -> list[RangeSpec]:
-    dir_by_year = {infer_year(path): path for path in data_dirs}
-    specs: list[RangeSpec] = []
-
+def _parse_custom_ranges(specs_raw: list[str]) -> dict[str, list[tuple[datetime, datetime]]]:
+    split_ranges: dict[str, list[tuple[datetime, datetime]]] = {"train": [], "val": [], "test": []}
     for raw in specs_raw:
         try:
             split, start_raw, end_raw = raw.split(":")
@@ -170,45 +139,50 @@ def build_custom_ranges(data_dirs: list[Path], specs_raw: list[str]) -> list[Ran
             raise ValueError(
                 f"Invalid --date-range '{raw}'. Expected split:YYYY-MM-DD:YYYY-MM-DD."
             ) from exc
-
-        if split not in {"train", "val", "test"}:
+        if split not in split_ranges:
             raise ValueError(f"Invalid split '{split}' in --date-range '{raw}'.")
-
         start = datetime.fromisoformat(start_raw)
         end = datetime.fromisoformat(end_raw)
         if start >= end:
             raise ValueError(f"Invalid --date-range '{raw}': start must be before end.")
-        if start.year != end.year:
-            raise ValueError(
-                f"Invalid --date-range '{raw}': start and end must stay within one year directory."
-            )
-        if start.year not in dir_by_year:
-            raise ValueError(
-                f"Invalid --date-range '{raw}': no data-dir provided for year {start.year}."
-            )
-
-        specs.append(
-            RangeSpec(
-                year=start.year,
-                start=start,
-                end=end,
-                split=split,
-                data_dir=dir_by_year[start.year],
-            )
-        )
-
-    return specs
+        split_ranges[split].append((start, end))
+    return split_ranges
 
 
-def make_dataset(spec: RangeSpec, step_hours: int, target_vars: tuple[str, ...]) -> ERA5Dataset:
-    return ERA5Dataset(
-        data_dirs=[spec.data_dir],
-        start_date=spec.start,
-        end_date=spec.end,
-        step_hours=step_hours,
-        include_extra_surf=True,
+def build_split_datasets(args: argparse.Namespace, data_dirs: list[Path], target_vars: tuple[str, ...]):
+    common_kwargs = dict(
+        data_dirs=data_dirs,
+        step_hours=args.step_hours,
+        include_extra_surf=False,
+        rollout_steps=1,
+        file_layout=args.file_layout,
         input_surf_vars=BASE_SURF_VAR_NAMES,
         target_surf_vars=target_vars,
+        static_path=args.static_path,
+    )
+    if args.date_range:
+        split_ranges = _parse_custom_ranges(args.date_range)
+        datasets = {
+            split: MultiRangeERA5Dataset(date_ranges=ranges, **common_kwargs)
+            for split, ranges in split_ranges.items()
+            if split in args.split and ranges
+        }
+        manifest_ranges = {
+            split: [
+                {"start": start.isoformat(), "end": end.isoformat()}
+                for start, end in ranges
+            ]
+            for split, ranges in split_ranges.items()
+            if split in args.split and ranges
+        }
+        return datasets, manifest_ranges, False
+
+    train_ds, val_ds, test_ds = make_era5_splits(**common_kwargs)
+    datasets = {"train": train_ds, "val": val_ds, "test": test_ds}
+    return (
+        {split: datasets[split] for split in args.split},
+        {},
+        True,
     )
 
 
@@ -354,6 +328,22 @@ def save_sample(
     torch.save(payload, path)
 
 
+def make_loader(args: argparse.Namespace, dataset) -> DataLoader:
+    loader_kwargs = dict(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        worker_init_fn=era5_worker_init_fn,
+        collate_fn=collate_era5_batch,
+        pin_memory=(args.device == "cuda"),
+    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    return DataLoader(**loader_kwargs)
+
+
 def main():
     args = parse_args()
     output_dir = args.output_dir
@@ -368,16 +358,13 @@ def main():
     print(f"Data dirs: {[str(p) for p in data_dirs]}")
     print(f"Splits: {args.split}")
     print(f"Target vars: {target_vars}")
-
-    if args.date_range:
-        ranges = build_custom_ranges(data_dirs, args.date_range)
-    else:
-        ranges = build_default_ranges(data_dirs, args.split)
-    for spec in ranges:
-        print(
-            f"  {spec.split:<5} year={spec.year} "
-            f"range=[{spec.start.date()} -> {spec.end.date()}) dir={spec.data_dir}"
-        )
+    print(f"File layout: {args.file_layout}")
+    print(f"Loader workers: {args.num_workers}  prefetch_factor: {args.prefetch_factor}")
+    if args.static_path is not None:
+        print(f"Static path override: {args.static_path}")
+    split_datasets, manifest_ranges, used_default_splits = build_split_datasets(args, data_dirs, target_vars)
+    for split, dataset in split_datasets.items():
+        print(f"  {split:<5} samples={len(dataset)}")
 
     aurora_cls = AuroraSmallPretrained if args.small else AuroraPretrained
     model = aurora_cls()
@@ -398,25 +385,23 @@ def main():
     metadata_written = False
     surface_head_module_name: str | None = None
     split_counts = {split: 0 for split in args.split}
+    skipped_existing = {split: 0 for split in args.split}
 
-    for spec in ranges:
-        split_dir = output_dir / spec.split
+    for split, dataset in split_datasets.items():
+        split_dir = output_dir / split
         split_dir.mkdir(parents=True, exist_ok=True)
-
-        dataset = make_dataset(spec, step_hours=args.step_hours, target_vars=target_vars)
+        loader = make_loader(args, dataset)
         print(
-            f"\nExtracting {spec.split} {spec.year}: "
-            f"{len(dataset)} samples from [{spec.start} -> {spec.end})",
+            f"\nExtracting {split}: {len(dataset)} samples",
             flush=True,
         )
 
         tap: SurfaceLatentTap | None = None
         try:
-            for idx in range(len(dataset)):
-                if args.max_samples_per_split is not None and split_counts[spec.split] >= args.max_samples_per_split:
+            for input_batch, targets in loader:
+                if args.max_samples_per_split is not None and split_counts[split] >= args.max_samples_per_split:
                     break
 
-                input_batch, targets = dataset[idx]
                 target_batch = targets[0]
                 for forbidden in target_vars:
                     assert forbidden not in input_batch.surf_vars, f"{forbidden} leaked into inputs"
@@ -425,7 +410,7 @@ def main():
                 sample_name = f"{target_time.isoformat().replace(':', '-')}.pt"
                 sample_path = split_dir / sample_name
                 if sample_path.exists() and not args.overwrite:
-                    split_counts[spec.split] += 1
+                    skipped_existing[split] += 1
                     continue
 
                 if tap is None:
@@ -461,21 +446,22 @@ def main():
                     source_time=input_batch.metadata.time[0],
                     target_batch=target_batch,
                     target_vars=target_vars,
-                    split=spec.split,
-                    year=spec.year,
+                    split=split,
+                    year=target_time.year,
                     latent_dtype=latent_dtype,
                     target_dtype=target_dtype,
                 )
-                split_counts[spec.split] += 1
+                split_counts[split] += 1
 
-                if split_counts[spec.split] % 25 == 0:
+                if split_counts[split] % 25 == 0:
                     print(
-                        f"  {spec.split}: wrote {split_counts[spec.split]} samples "
+                        f"  {split}: wrote {split_counts[split]} samples "
                         f"(latest {sample_name})",
                         flush=True,
                     )
         finally:
             dataset.close()
+            del loader
             if tap is not None:
                 tap.close()
 
@@ -485,21 +471,17 @@ def main():
         "target_vars": list(target_vars),
         "step_hours": args.step_hours,
         "small": args.small,
+        "file_layout": args.file_layout,
+        "num_workers": args.num_workers,
+        "prefetch_factor": args.prefetch_factor,
         "surface_head_var": args.surface_head_var,
         "surface_head_module": surface_head_module_name,
         "latent_dtype": args.latent_dtype,
         "target_dtype": args.target_dtype,
         "counts": split_counts,
-        "ranges": [
-            {
-                "split": spec.split,
-                "year": spec.year,
-                "data_dir": str(spec.data_dir),
-                "start": spec.start.isoformat(),
-                "end": spec.end.isoformat(),
-            }
-            for spec in ranges
-        ],
+        "skipped_existing": skipped_existing,
+        "used_default_stage1_splits": used_default_splits,
+        "ranges": manifest_ranges,
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 

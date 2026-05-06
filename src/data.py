@@ -82,6 +82,12 @@ def _add_density_channels(surf_dict: dict[str, torch.Tensor]) -> dict[str, torch
     return surf_dict
 
 
+def _base_surface_var(name: str) -> str:
+    if name.endswith("_density"):
+        return name[: -len("_density")]
+    return name
+
+
 # ---------------------------------------------------------------------------
 # File index helpers
 # ---------------------------------------------------------------------------
@@ -281,6 +287,9 @@ class ERA5Dataset(Dataset):
         include_extra_surf: bool = True,
         rollout_steps: int = 1,
         file_layout: Literal["chunked", "per_timestep"] = "chunked",
+        input_surf_vars: tuple[str, ...] | None = None,
+        target_surf_vars: tuple[str, ...] | None = None,
+        static_path: str | Path | None = None,
     ):
         if isinstance(data_dirs, (str, Path)):
             data_dirs = [data_dirs]
@@ -290,20 +299,23 @@ class ERA5Dataset(Dataset):
         self.rollout_steps = rollout_steps
         self.file_layout = file_layout
 
-        self.surf_map = SURF_ERA5_TO_AURORA.copy()
-        if include_extra_surf:
-            self.surf_map.update(EXTRA_SURF_ERA5_TO_AURORA)
+        default_input_surf = SOIL_SURF_VARS if include_extra_surf else BASE_SURF_VAR_NAMES
+        self.input_surf_vars = tuple(input_surf_vars or default_input_surf)
+        self.target_surf_vars = tuple(target_surf_vars or self.input_surf_vars)
+        self._needed_raw_surf_vars = {
+            _base_surface_var(name) for name in self.input_surf_vars + self.target_surf_vars
+        }
 
         self.surface_files: dict[tuple[int, int], Path] = {}
         self.atmos_chunks: list[tuple[datetime, datetime, Path]] = []
         self.surf_paths_by_time: dict[datetime, Path] = {}
         self.atmos_paths_by_time: dict[datetime, Path] = {}
-        static_path = None
+        discovered_static_path = Path(static_path) if static_path is not None else None
 
         for d in self.data_dirs:
             candidate = d / "static.nc"
-            if candidate.exists() and static_path is None:
-                static_path = candidate
+            if candidate.exists() and discovered_static_path is None:
+                discovered_static_path = candidate
 
             if file_layout == "chunked":
                 self.surface_files.update(_parse_surface_files(d))
@@ -316,7 +328,7 @@ class ERA5Dataset(Dataset):
 
         self.atmos_chunks.sort(key=lambda x: x[0])
 
-        if static_path is None:
+        if discovered_static_path is None:
             raise FileNotFoundError("No static.nc found in any data directory")
 
         if file_layout == "per_timestep":
@@ -327,7 +339,7 @@ class ERA5Dataset(Dataset):
                 )
 
         # Load static vars once (small, reused every sample)
-        static_ds = xr.open_dataset(static_path, engine="netcdf4")
+        static_ds = xr.open_dataset(discovered_static_path, engine="netcdf4")
         self.static_vars = {
             STATIC_ERA5_TO_AURORA[k]: torch.from_numpy(static_ds[k].values[0]).float()
             for k in STATIC_ERA5_TO_AURORA
@@ -459,16 +471,42 @@ class ERA5Dataset(Dataset):
             idx = _surface_time_index(dt)
             sliced = ds.isel(valid_time=idx)
         result = {}
-        for era5_name, aurora_name in self.surf_map.items():
-            result[aurora_name] = torch.from_numpy(sliced[era5_name].values).float()
+        full_surf_map = SURF_ERA5_TO_AURORA | EXTRA_SURF_ERA5_TO_AURORA
+        for era5_name, aurora_name in full_surf_map.items():
+            if aurora_name in self._needed_raw_surf_vars:
+                result[aurora_name] = torch.from_numpy(sliced[era5_name].values).float()
         return result
 
-    def _load_surface(self, dt: datetime) -> dict[str, torch.Tensor]:
-        """Load surface variables with density channels applied."""
-        surf = self._load_surface_raw(dt)
-        if self.include_extra_surf:
-            surf = _add_density_channels(surf)
-        return surf
+    def _select_surface_vars(
+        self,
+        raw_surf: dict[str, torch.Tensor],
+        selected_vars: tuple[str, ...],
+    ) -> dict[str, torch.Tensor]:
+        """Select and post-process the requested surface variables.
+
+        Density channels are materialized on demand, and hydrology values are
+        NaN-filled to match the fine-tuning data path whenever they are used.
+        """
+        out: dict[str, torch.Tensor] = {}
+        for name in selected_vars:
+            base_name = _base_surface_var(name)
+            if base_name not in raw_surf:
+                raise KeyError(f"Requested surface variable {name!r} is unavailable at this timestep.")
+            raw_value = raw_surf[base_name]
+            if base_name in DENSITY_VARS:
+                density = (~torch.isnan(raw_value)).float()
+                clean = raw_value.nan_to_num(0.0)
+                if name.endswith("_density"):
+                    out[name] = density
+                else:
+                    out[name] = clean
+            else:
+                out[name] = raw_value
+        return out
+
+    def _load_surface(self, dt: datetime, selected_vars: tuple[str, ...]) -> dict[str, torch.Tensor]:
+        raw_surf = self._load_surface_raw(dt)
+        return self._select_surface_vars(raw_surf, selected_vars)
 
     def _load_atmos(self, dt: datetime) -> dict[str, torch.Tensor]:
         """Load atmospheric variables for a single timestamp."""
@@ -494,7 +532,7 @@ class ERA5Dataset(Dataset):
         Returns ``(surf_dict, atmos_dict)`` with density channels applied.
         Useful for Stage 2 replay buffer ground-truth lookups.
         """
-        return self._load_surface(dt), self._load_atmos(dt)
+        return self._load_surface(dt, self.input_surf_vars), self._load_atmos(dt)
 
     def close(self):
         """Close all cached file handles."""
@@ -525,8 +563,8 @@ class ERA5Dataset(Dataset):
         t0, t1 = timestamps[0], timestamps[1]
         target_times = timestamps[2:]
 
-        surf0 = self._load_surface(t0)
-        surf1 = self._load_surface(t1)
+        surf0 = self._load_surface(t0, self.input_surf_vars)
+        surf1 = self._load_surface(t1, self.input_surf_vars)
         atmos0 = self._load_atmos(t0)
         atmos1 = self._load_atmos(t1)
 
@@ -547,7 +585,7 @@ class ERA5Dataset(Dataset):
 
         targets: list[Batch] = []
         for tt in target_times:
-            surf_t = self._load_surface(tt)
+            surf_t = self._load_surface(tt, self.target_surf_vars)
             atmos_t = self._load_atmos(tt)
             targets.append(self._make_target_batch(surf_t, atmos_t, tt))
 
@@ -588,6 +626,9 @@ class MultiRangeERA5Dataset(Dataset):
         include_extra_surf: bool = True,
         rollout_steps: int = 1,
         file_layout: Literal["chunked", "per_timestep"] = "chunked",
+        input_surf_vars: tuple[str, ...] | None = None,
+        target_surf_vars: tuple[str, ...] | None = None,
+        static_path: str | Path | None = None,
     ):
         self.datasets: list[ERA5Dataset] = []
         self._lengths: list[int] = []
@@ -601,6 +642,9 @@ class MultiRangeERA5Dataset(Dataset):
                 include_extra_surf=include_extra_surf,
                 rollout_steps=rollout_steps,
                 file_layout=file_layout,
+                input_surf_vars=input_surf_vars,
+                target_surf_vars=target_surf_vars,
+                static_path=static_path,
             )
             self.datasets.append(ds)
             self._lengths.append(len(ds))
@@ -648,6 +692,9 @@ def make_era5_splits(
     include_extra_surf: bool = True,
     rollout_steps: int = 1,
     file_layout: Literal["chunked", "per_timestep"] = "chunked",
+    input_surf_vars: tuple[str, ...] | None = None,
+    target_surf_vars: tuple[str, ...] | None = None,
+    static_path: str | Path | None = None,
 ) -> tuple[MultiRangeERA5Dataset, MultiRangeERA5Dataset, MultiRangeERA5Dataset]:
     """Create train / val / test splits from (possibly non-contiguous) date ranges.
 
@@ -669,6 +716,9 @@ def make_era5_splits(
         include_extra_surf=include_extra_surf,
         rollout_steps=rollout_steps,
         file_layout=file_layout,
+        input_surf_vars=input_surf_vars,
+        target_surf_vars=target_surf_vars,
+        static_path=static_path,
     )
     train_ds = MultiRangeERA5Dataset(date_ranges=train_ranges, **kwargs)
     val_ds = MultiRangeERA5Dataset(date_ranges=val_ranges, **kwargs)
