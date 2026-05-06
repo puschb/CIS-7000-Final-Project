@@ -45,6 +45,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -289,6 +291,7 @@ def eval_split(
     snapshot_indices: set[int],
     output_dir: Path,
     csv_writer: csv.writer,
+    csv_file,  # file handle so we can flush per row
     rng: np.random.Generator,
 ) -> tuple[
     dict[str, dict[str, torch.Tensor]],
@@ -398,6 +401,10 @@ def eval_split(
                         snap_path,
                     )
 
+            # Flush after each sample so per_sample_metrics.csv is durable
+            # even if the dataloader teardown segfaults later.
+            csv_file.flush()
+
             n_seen += 1
             if n_seen == 1:
                 print(f"  {split_name}: first sample | source={source_time} target={target_time} "
@@ -406,18 +413,67 @@ def eval_split(
                 rate = n_seen / max(time.time() - t0, 1e-6)
                 print(f"  {split_name}: evaluated {n_seen} / {n_total} samples "
                       f"({rate:.2f} samples/s)", flush=True)
-    finally:
-        del loader_iter
-        del loader
-        dataset.close()
 
-    summary = {f"{split_name}_samples": n_seen}
-    for v in target_vars:
-        c = max(accum[v]["count"], 1)
-        summary[f"{split_name}_{v}_mae"]  = accum[v]["abs"] / c
-        summary[f"{split_name}_{v}_rmse"] = (accum[v]["sq"] / c) ** 0.5
-    spatial_maps, count_map = spatial.finalize()
-    return spatial_maps, count_map, scatter.finalize(), summary
+        # Loop has finished naturally (StopIteration or --limit). Persist this
+        # split's outputs to disk RIGHT NOW, before the dataloader teardown in
+        # the `finally` block has a chance to segfault during multi-worker
+        # cleanup (UCX/libucs is known to crash here). After this point
+        # everything we computed for this split is durable on disk.
+        summary = {f"{split_name}_samples": n_seen}
+        for v in target_vars:
+            c = max(accum[v]["count"], 1)
+            summary[f"{split_name}_{v}_mae"]  = accum[v]["abs"] / c
+            summary[f"{split_name}_{v}_rmse"] = (accum[v]["sq"] / c) ** 0.5
+        spatial_maps, count_map = spatial.finalize()
+        scatter_data = scatter.finalize()
+
+        aggregates_dir = output_dir / "spatial_aggregates"
+        aggregates_dir.mkdir(parents=True, exist_ok=True)
+        for var, maps in spatial_maps.items():
+            for metric_name, tensor in maps.items():
+                np.save(
+                    aggregates_dir / f"{split_name}_{var}_{metric_name}.npy",
+                    tensor.numpy(),
+                )
+        if count_map is not None:
+            np.save(
+                aggregates_dir / f"{split_name}_count.npy",
+                count_map.numpy().astype(np.int32),
+            )
+        torch.save(scatter_data, output_dir / f"scatter_samples_{split_name}.pt")
+        # Partial summary so a later-split crash doesn't lose the earlier ones.
+        partial_path = output_dir / "eval_summary_partial.json"
+        partial_payload: dict
+        if partial_path.exists():
+            try:
+                partial_payload = json.loads(partial_path.read_text())
+            except Exception:
+                partial_payload = {"metrics": {}}
+        else:
+            partial_payload = {"metrics": {}}
+        partial_payload["metrics"].update(summary)
+        partial_payload["last_completed_split"] = split_name
+        partial_path.write_text(json.dumps(partial_payload, indent=2))
+        print(f"  {split_name}: per-split outputs saved to disk "
+              f"(spatial_aggregates/, scatter_samples_{split_name}.pt, eval_summary_partial.json)",
+              flush=True)
+    finally:
+        # Now teardown is allowed to crash; everything is on disk.
+        try:
+            del loader_iter
+        except NameError:
+            pass
+        try:
+            del loader
+        except NameError:
+            pass
+        try:
+            dataset.close()
+        except Exception as exc:
+            print(f"  {split_name}: warning — dataset.close() raised {exc!r} "
+                  f"(outputs already saved)", flush=True)
+
+    return spatial_maps, count_map, scatter_data, summary
 
 
 # ---------------------------------------------------------------------------
@@ -530,21 +586,12 @@ def main() -> None:
                     snapshot_indices=snap_idx,
                     output_dir=args.output_dir,
                     csv_writer=writer,
+                    csv_file=f,
                     rng=rng,
                 )
-
-                for var, maps in spatial_maps.items():
-                    for metric_name, tensor in maps.items():
-                        np.save(
-                            aggregates_dir / f"{split_name}_{var}_{metric_name}.npy",
-                            tensor.numpy(),
-                        )
-                if count_map is not None:
-                    np.save(
-                        aggregates_dir / f"{split_name}_count.npy",
-                        count_map.numpy().astype(np.int32),
-                    )
-
+                # eval_split has already persisted spatial_aggregates/ and
+                # scatter_samples_<split>.pt to disk; main only needs the
+                # in-memory copy for the combined scatter file below.
                 scatter_all[split_name] = scatter
                 summary.update(split_summary)
                 print(json.dumps(split_summary, indent=2), flush=True)
@@ -587,7 +634,14 @@ def main() -> None:
     print(f"Snapshots        : {args.output_dir / 'snapshots'}")
     print(f"Scatter samples  : {scatter_path}")
     print(f"Eval summary     : {summary_path}")
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 if __name__ == "__main__":
     main()
+    # Skip Python's normal interpreter shutdown: the multi-worker DataLoader
+    # cleanup and CUDA atexit handlers tend to hit UCX (libucs) and segfault
+    # on Nautilus pods even after all useful work is done. Everything we care
+    # about is already on disk by this point, so just exit hard.
+    os._exit(0)
