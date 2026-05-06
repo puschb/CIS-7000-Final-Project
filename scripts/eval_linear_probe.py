@@ -217,7 +217,10 @@ def make_loader(args: argparse.Namespace, dataset) -> DataLoader:
         batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
+        # This is a one-pass evaluation loader, so keep worker lifetime short.
+        # Using persistent workers here has triggered teardown instability on
+        # Nautilus after a split finishes.
+        persistent_workers=False,
         worker_init_fn=era5_worker_init_fn,
         collate_fn=collate_era5_batch,
         pin_memory=(args.device == "cuda"),
@@ -309,10 +312,15 @@ def eval_split(
     n_seen = 0
     t0 = time.time()
     loader = make_loader(args, dataset)
+    loader_iter = iter(loader)
 
     try:
-        for input_batch, targets in loader:
+        while True:
             if args.limit is not None and n_seen >= args.limit:
+                break
+            try:
+                input_batch, targets = next(loader_iter)
+            except StopIteration:
                 break
             target_batch = targets[0]
 
@@ -399,8 +407,9 @@ def eval_split(
                 print(f"  {split_name}: evaluated {n_seen} / {n_total} samples "
                       f"({rate:.2f} samples/s)", flush=True)
     finally:
-        dataset.close()
+        del loader_iter
         del loader
+        dataset.close()
 
     summary = {f"{split_name}_samples": n_seen}
     for v in target_vars:
