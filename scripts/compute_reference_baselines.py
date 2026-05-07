@@ -43,6 +43,8 @@ Usage on Nautilus
         --baselines persistence climatology
 
 Runtime: dominated by ERA5 IO.  No GPU is required.
+The implementation intentionally reads only per-step surface files; it does not
+instantiate the Aurora ERA5Dataset and does not load atmospheric NetCDFs.
 """
 
 from __future__ import annotations
@@ -58,21 +60,25 @@ import csv
 import json
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import xarray as xr
 
 from src.data import (
-    BASE_SURF_VAR_NAMES,
+    DEFAULT_TEST_RANGES,
+    DEFAULT_TRAIN_RANGES,
+    DEFAULT_VAL_RANGES,
     DENSITY_VARS,
     EXTRA_SURF_VAR_NAMES,
-    SOIL_SURF_VARS,
-    collate_era5_batch,
-    era5_worker_init_fn,
-    make_era5_splits,
+    EXTRA_SURF_ERA5_TO_AURORA,
+    STATIC_ERA5_TO_AURORA,
+    SURF_ERA5_TO_AURORA,
+    _base_surface_var,
+    _parse_per_timestep_surface_files,
 )
 
 
@@ -99,8 +105,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-hours", type=int, default=6)
     parser.add_argument("--static-path", type=Path, default=None)
     parser.add_argument("--num-workers", type=int, default=0,
-                        help="DataLoader workers.  Default 0 because the eval is IO-bound and "
-                             "multi-worker teardown segfaults via UCX on Nautilus.")
+                        help="Ignored. Kept for compatibility; this script uses a surface-only "
+                             "iterator and no DataLoader workers.")
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--num-snapshots", type=int, default=0,
                         help="Per-split full-grid (truth, pred, abs_err) snapshots saved as .pt; 0 disables")
@@ -208,20 +214,125 @@ class ScatterReservoir:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_loader(args: argparse.Namespace, dataset) -> DataLoader:
-    kwargs = dict(
-        dataset=dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-        worker_init_fn=era5_worker_init_fn,
-        collate_fn=collate_era5_batch,
-        pin_memory=False,
-    )
-    if args.num_workers > 0:
-        kwargs["prefetch_factor"] = args.prefetch_factor
-    return DataLoader(**kwargs)
+@dataclass
+class SurfaceOnlySample:
+    source_time: datetime
+    target_time: datetime
+    source: dict[str, torch.Tensor]
+    target: dict[str, torch.Tensor]
+    densities: dict[str, torch.Tensor]
+
+
+class SurfaceOnlySplit:
+    """Surface-only replacement for ERA5Dataset for reference baselines.
+
+    The Aurora dataset loads atmospheric files because model inference needs them.
+    Persistence and climatology never use atmosphere, so this class indexes the
+    same timestamp sequences but opens only ``*-surface.nc`` files.
+    """
+
+    def __init__(
+        self,
+        data_dirs: list[Path],
+        date_ranges: list[tuple[datetime, datetime]],
+        target_vars: tuple[str, ...],
+        step_hours: int,
+        static_path: Path | None,
+        mask_kind: str,
+    ):
+        self.data_dirs = data_dirs
+        self.target_vars = target_vars
+        self.step = timedelta(hours=step_hours)
+        self.mask_kind = mask_kind
+        self.surf_paths_by_time: dict[datetime, Path] = {}
+        self.era5_by_var = {
+            aurora_name: era5_name
+            for era5_name, aurora_name in (SURF_ERA5_TO_AURORA | EXTRA_SURF_ERA5_TO_AURORA).items()
+        }
+        self.needed_era5_vars = sorted({
+            self.era5_by_var[_base_surface_var(name)] for name in target_vars
+        })
+
+        discovered_static_path = static_path
+        for data_dir in data_dirs:
+            candidate = data_dir / "static.nc"
+            if candidate.exists() and discovered_static_path is None:
+                discovered_static_path = candidate
+            self.surf_paths_by_time.update(_parse_per_timestep_surface_files(data_dir))
+
+        if not self.surf_paths_by_time:
+            raise FileNotFoundError("No per-timestep *-surface.nc files found in data dirs")
+        if discovered_static_path is None:
+            raise FileNotFoundError("No static.nc found in any data directory")
+
+        with xr.open_dataset(discovered_static_path, engine="netcdf4") as static_ds:
+            self.static_vars = {
+                STATIC_ERA5_TO_AURORA[k]: torch.from_numpy(static_ds[k].values[0]).float()
+                for k in STATIC_ERA5_TO_AURORA
+            }
+
+        self.sequences = self._build_sequences(date_ranges)
+        if not self.sequences:
+            raise ValueError(f"No valid surface-only samples found for ranges: {date_ranges}")
+
+        first_target = self._load_surface(self.sequences[0][2], include_density=False)
+        first_var = target_vars[0]
+        self.shape = tuple(first_target[first_var].shape)
+
+    def _build_sequences(
+        self,
+        date_ranges: list[tuple[datetime, datetime]],
+    ) -> list[tuple[datetime, datetime, datetime]]:
+        avail = set(self.surf_paths_by_time)
+        sequences: list[tuple[datetime, datetime, datetime]] = []
+
+        for start_date, end_date in date_ranges:
+            for t1 in sorted(avail):
+                if t1 < start_date or t1 >= end_date:
+                    continue
+                t0 = t1 - self.step
+                t2 = t1 + self.step
+                timestamps = (t0, t1, t2)
+                if not all(ts in avail for ts in timestamps):
+                    continue
+                if any(ts.month != t1.month or ts.year != t1.year for ts in timestamps):
+                    continue
+                sequences.append(timestamps)
+        return sequences
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def _load_surface(self, dt: datetime, include_density: bool) -> dict[str, torch.Tensor]:
+        path = self.surf_paths_by_time[dt]
+        with xr.open_dataset(path, engine="netcdf4") as ds:
+            sliced = ds[self.needed_era5_vars].load().isel(valid_time=0)
+
+        out: dict[str, torch.Tensor] = {}
+        for name in self.target_vars:
+            base_name = _base_surface_var(name)
+            raw = torch.from_numpy(sliced[self.era5_by_var[base_name]].values).float()
+            out[base_name] = raw.nan_to_num(0.0) if base_name in DENSITY_VARS else raw
+            if include_density and base_name in DENSITY_VARS:
+                out[f"{base_name}_density"] = (~torch.isnan(raw)).float()
+        return out
+
+    def __getitem__(self, idx: int) -> SurfaceOnlySample:
+        _, source_time, target_time = self.sequences[idx]
+        source = self._load_surface(source_time, include_density=False)
+        target = self._load_surface(target_time, include_density=self.mask_kind == "density")
+        densities = {f"{v}_density": target[f"{v}_density"] for v in self.target_vars
+                     if f"{v}_density" in target}
+        return SurfaceOnlySample(
+            source_time=source_time,
+            target_time=target_time,
+            source=source,
+            target=target,
+            densities=densities,
+        )
+
+    def close(self) -> None:
+        return None
 
 
 def evenly_spaced_indices(n: int, k: int) -> list[int]:
@@ -237,49 +348,26 @@ def safe_ts(ts: str) -> str:
 
 
 def build_land_mask(
-    sample_targets, target_vars: tuple[str, ...], mask_kind: str, threshold: float,
+    dataset: SurfaceOnlySplit,
+    sample: SurfaceOnlySample,
+    target_vars: tuple[str, ...],
+    mask_kind: str,
+    threshold: float,
+    valid_h: int,
+    valid_w: int,
 ) -> dict[str, torch.Tensor]:
-    """Build a per-variable boolean land mask of shape (H, W).
-
-    - lsm:     same mask for every variable, from static_vars["lsm"] > threshold.
-    - density: per-variable, from target.surf_vars[f"{var}_density"] >= threshold.
-    """
+    """Build per-variable boolean masks, matching the linear-probe eval."""
     if mask_kind == "lsm":
-        target_batch = sample_targets[0]
-        m = (target_batch.static_vars["lsm"] > threshold).cpu()
+        m = (dataset.static_vars["lsm"][:valid_h, :valid_w] > threshold).cpu()
         return {v: m for v in target_vars}
-    elif mask_kind == "density":
+    if mask_kind == "density":
+        fallback = (dataset.static_vars["lsm"][:valid_h, :valid_w] > threshold).cpu()
         masks: dict[str, torch.Tensor] = {}
-        target_batch = sample_targets[0]
         for v in target_vars:
-            density_key = f"{v}_density"
-            if density_key in target_batch.surf_vars:
-                d = target_batch.surf_vars[density_key][:, -1].squeeze(0)
-                masks[v] = (d >= threshold).cpu()
-            else:
-                m = (target_batch.static_vars["lsm"] > threshold).cpu()
-                masks[v] = m
+            density = sample.densities.get(f"{v}_density")
+            masks[v] = (density[:valid_h, :valid_w] >= threshold).cpu() if density is not None else fallback
         return masks
-    else:
-        raise ValueError(f"unknown mask kind: {mask_kind}")
-
-
-def cropped_truth(target_batch, var: str, valid_h: int, valid_w: int) -> torch.Tensor:
-    """Return (H, W) target value at t+6h for `var`, cropped to valid_h × valid_w."""
-    return (
-        target_batch.surf_vars[var][:, -1, :valid_h, :valid_w]
-        .to(dtype=torch.float32)
-        .squeeze(0)
-    )
-
-
-def cropped_source(input_batch, var: str, valid_h: int, valid_w: int) -> torch.Tensor:
-    """Return (H, W) input value at t for `var` (the second history slot)."""
-    return (
-        input_batch.surf_vars[var][:, -1, :valid_h, :valid_w]
-        .to(dtype=torch.float32)
-        .squeeze(0)
-    )
+    raise ValueError(f"unknown mask kind: {mask_kind}")
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +376,7 @@ def cropped_source(input_batch, var: str, valid_h: int, valid_w: int) -> torch.T
 
 def build_hourly_climatology(
     args: argparse.Namespace,
-    train_ds,
+    train_ds: SurfaceOnlySplit,
     target_vars: tuple[str, ...],
     valid_h: int,
     valid_w: int,
@@ -306,20 +394,20 @@ def build_hourly_climatology(
     sums = torch.zeros((24, n_vars, valid_h, valid_w), dtype=torch.float64)
     counts = torch.zeros(24, dtype=torch.int64)
 
-    loader = make_loader(args, train_ds)
     n_seen = 0
     t0 = time.time()
     print(f"  climatology fit: train_ds has {len(train_ds)} samples", flush=True)
 
-    for input_batch, targets in loader:
+    n_total = len(train_ds) if args.limit is None else min(len(train_ds), args.limit)
+    for idx in range(n_total):
         if args.limit is not None and n_seen >= args.limit:
             break
-        target_batch = targets[0]
-        target_time = target_batch.metadata.time[0]
+        sample = train_ds[idx]
+        target_time = sample.target_time
         h = int(target_time.hour)
         for vi, v in enumerate(var_order):
-            y = cropped_truth(target_batch, v, valid_h, valid_w).double()
-            sums[h, vi] += y.cpu()
+            y = sample.target[v][:valid_h, :valid_w].double()
+            sums[h, vi] += y
         counts[h] += 1
         n_seen += 1
         if n_seen == 1:
@@ -330,10 +418,6 @@ def build_hourly_climatology(
             print(f"  climatology fit: accumulated {n_seen} train samples ({rate:.2f} samples/s)",
                   flush=True)
 
-    try:
-        del loader
-    except BaseException as e:  # noqa: BLE001
-        print(f"  warning during loader teardown: {e!r}", flush=True)
     train_ds.close()
 
     # Per-pixel mean = sum / count  (broadcast over H, W; clamp count to avoid /0)
@@ -352,7 +436,7 @@ def eval_split(
     args: argparse.Namespace,
     baseline_name: str,
     split_name: str,
-    dataset,
+    dataset: SurfaceOnlySplit,
     target_vars: tuple[str, ...],
     output_dir: Path,
     csv_writer,
@@ -383,30 +467,30 @@ def eval_split(
     accum = {v: {"abs": 0.0, "sq": 0.0, "count": 0} for v in target_vars}
     n_seen = 0
     t0 = time.time()
-    loader = make_loader(args, dataset)
-    loader_iter = iter(loader)
 
     try:
-        while True:
-            if args.limit is not None and n_seen >= args.limit:
-                break
-            try:
-                input_batch, targets = next(loader_iter)
-            except StopIteration:
-                break
-            target_batch = targets[0]
-            source_time = input_batch.metadata.time[0].isoformat()
-            target_time = target_batch.metadata.time[0]
+        for idx in range(n_total):
+            sample = dataset[idx]
+            source_time = sample.source_time.isoformat()
+            target_time = sample.target_time
             target_time_str = target_time.isoformat()
             do_snapshot = n_seen in snapshot_indices
 
-            masks = build_land_mask(targets, target_vars, args.mask, args.mask_threshold)
+            masks = build_land_mask(
+                dataset=dataset,
+                sample=sample,
+                target_vars=target_vars,
+                mask_kind=args.mask,
+                threshold=args.mask_threshold,
+                valid_h=valid_h,
+                valid_w=valid_w,
+            )
 
             for var in target_vars:
-                truth_2d = cropped_truth(target_batch, var, valid_h, valid_w)
+                truth_2d = sample.target[var][:valid_h, :valid_w]
 
                 if baseline_name == "persistence":
-                    pred_2d = cropped_source(input_batch, var, valid_h, valid_w)
+                    pred_2d = sample.source[var][:valid_h, :valid_w]
                 elif baseline_name == "climatology":
                     assert climatology is not None and var_order is not None
                     vi = var_order.index(var)
@@ -507,12 +591,6 @@ def eval_split(
         partial_path.write_text(json.dumps(partial_payload, indent=2))
         print(f"  {split_name}: per-split outputs saved to disk", flush=True)
     finally:
-        for cleanup_step in ("loader_iter", "loader"):
-            try:
-                if cleanup_step in locals():
-                    del locals()[cleanup_step]
-            except BaseException as exc:  # noqa: BLE001
-                print(f"  {split_name}: warning — del {cleanup_step} raised {exc!r}", flush=True)
         try:
             dataset.close()
         except BaseException as exc:  # noqa: BLE001
@@ -543,24 +621,21 @@ def prepare_output_dir(path: Path, overwrite: bool) -> None:
 
 
 def make_split_datasets(args: argparse.Namespace, target_vars: tuple[str, ...]):
-    """Build train/val/test datasets WITH hydrology in input (so persistence
-    can read y(t)) and WITH density channels in target (so the density-mask
-    code path works).  Same default date splits as the linear-probe fit.
-    """
-    target_with_density = list(target_vars)
-    for v in target_vars:
-        if v in DENSITY_VARS and f"{v}_density" not in target_with_density:
-            target_with_density.append(f"{v}_density")
-    return make_era5_splits(
-        data_dirs=[Path(p) for p in args.data_dir],
+    """Build train/val/test splits using only per-timestep surface files."""
+    if args.file_layout != "per_timestep":
+        raise ValueError("surface-only reference baselines currently require --file-layout per_timestep")
+    data_dirs = [Path(p) for p in args.data_dir]
+    kwargs = dict(
+        data_dirs=data_dirs,
+        target_vars=target_vars,
         step_hours=args.step_hours,
-        include_extra_surf=True,
-        rollout_steps=1,
-        file_layout=args.file_layout,
-        # SOIL_SURF_VARS already includes the soil density channels in input.
-        input_surf_vars=SOIL_SURF_VARS,
-        target_surf_vars=tuple(target_with_density),
         static_path=args.static_path,
+        mask_kind=args.mask,
+    )
+    return (
+        SurfaceOnlySplit(date_ranges=DEFAULT_TRAIN_RANGES, **kwargs),
+        SurfaceOnlySplit(date_ranges=DEFAULT_VAL_RANGES, **kwargs),
+        SurfaceOnlySplit(date_ranges=DEFAULT_TEST_RANGES, **kwargs),
     )
 
 
@@ -580,13 +655,9 @@ def run_baseline(
     print(f"  Dataset sizes | train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}",
           flush=True)
 
-    # Determine the valid (H, W) crop using a single sample.  All samples share
-    # the same lat/lon grid, so this is safe.
+    # Determine the valid (H, W) crop.  All samples share the same lat/lon grid.
     probe_split = next(s for s in args.splits if len(splits[s]) > 0)
-    probe_input, probe_targets = splits[probe_split][0]
-    probe_var = target_vars[0]
-    probe_truth = probe_targets[0].surf_vars[probe_var][:, -1]
-    H, W = int(probe_truth.shape[-2]), int(probe_truth.shape[-1])
+    H, W = splits[probe_split].shape
     print(f"  Grid: {H} x {W}", flush=True)
 
     # For climatology, build the per-(hour, var, pixel) lookup from training.
@@ -691,6 +762,11 @@ def main() -> None:
     print(f"Target vars: {target_vars}")
     print(f"Mask: {args.mask} > {args.mask_threshold}")
     print(f"File layout: {args.file_layout}")
+    if args.num_workers:
+        print(
+            f"Note: --num-workers={args.num_workers} is ignored; using surface-only direct IO.",
+            flush=True,
+        )
 
     for baseline_name in args.baselines:
         run_baseline(args, baseline_name, target_vars)
