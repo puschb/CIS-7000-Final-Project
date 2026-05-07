@@ -1,0 +1,45 @@
+{
+  "baseline": "climatology",
+  "data_dirs": [
+    "/mnt/data/era5/per-step/2024",
+    "/mnt/data/era5/per-step/2025"
+  ],
+  "splits": [
+    "val",
+    "test"
+  ],
+  "target_vars": [
+    "swvl1",
+    "stl1",
+    "sd"
+  ],
+  "var_units": {
+    "swvl1": "m^3/m^3",
+    "stl1": "K",
+    "sd": "m"
+  },
+  "mask": "lsm",
+  "mask_threshold": 0.5,
+  "step_hours": 6,
+  "file_layout": "per_timestep",
+  "num_snapshots": 0,
+  "scatter_target": 50000,
+  "seed": 0,
+  "metrics": {
+    "val_samples": 708,
+    "val_swvl1_mae": 0.029038468656986522,
+    "val_swvl1_rmse": 0.048669797274928706,
+    "val_stl1_mae": 2.515897933407171,
+    "val_stl1_rmse": 3.558780248347743,
+    "val_sd_mae": 0.0022294816267024835,
+    "val_sd_rmse": 0.012575822030863725,
+    "test_samples": 756,
+    "test_swvl1_mae": 0.03316171868219498,
+    "test_swvl1_rmse": 0.05526702320242039,
+    "test_stl1_mae": 2.8533789531560587,
+    "test_stl1_rmse": 3.866267265490314,
+    "test_sd_mae": 0.00232976350678213,
+    "test_sd_rmse": 0.013222459233480793
+  },
+  "climatology_strategy": "hour_of_day"
+}
