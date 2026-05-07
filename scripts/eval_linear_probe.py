@@ -50,6 +50,15 @@ import sys
 import time
 from pathlib import Path
 
+# Ask UCX (libucs.so) NOT to install its own SIGSEGV/SIGBUS/SIGABRT handlers.
+# Some Nautilus pods load UCX via NCCL/MPI even for single-GPU runs, and its
+# crash handler races with PyTorch / CUDA atexit shutdown — that's the
+# "Caught signal 11" backtrace at the end of a successful run. Setting this
+# before importing torch is enough; we keep our own outputs safe via per-split
+# disk saves and a final os._exit(0) regardless.
+os.environ.setdefault("UCX_HANDLE_ERRORS", "none")
+os.environ.setdefault("UCX_ERROR_SIGNALS", "")
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -458,20 +467,27 @@ def eval_split(
               f"(spatial_aggregates/, scatter_samples_{split_name}.pt, eval_summary_partial.json)",
               flush=True)
     finally:
-        # Now teardown is allowed to crash; everything is on disk.
-        try:
-            del loader_iter
-        except NameError:
-            pass
-        try:
-            del loader
-        except NameError:
-            pass
+        # All outputs for this split are already on disk.  The teardown below
+        # is a known segfault hazard on Nautilus when num_workers > 0.  Wrap
+        # everything broadly so the process can move on to the next split.
+        for cleanup_step in ("loader_iter", "loader"):
+            try:
+                if cleanup_step in locals():
+                    del locals()[cleanup_step]
+            except BaseException as exc:  # noqa: BLE001
+                print(f"  {split_name}: warning — del {cleanup_step} raised "
+                      f"{exc!r} (outputs already saved)", flush=True)
         try:
             dataset.close()
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001
             print(f"  {split_name}: warning — dataset.close() raised {exc!r} "
                   f"(outputs already saved)", flush=True)
+        # Best-effort GPU memory cleanup so the next split gets a fresh slate.
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except BaseException:  # noqa: BLE001
+            pass
 
     return spatial_maps, count_map, scatter_data, summary
 
@@ -573,22 +589,30 @@ def main() -> None:
                 print(f"\n=== Split: {split_name} (n={n}, snapshot indices={sorted(snap_idx)}) ===",
                       flush=True)
 
-                spatial_maps, count_map, scatter, split_summary = eval_split(
-                    args=args,
-                    split_name=split_name,
-                    model=model,
-                    tap=tap,
-                    dataset=ds,
-                    target_vars=target_vars,
-                    norm_stats=norm_stats,
-                    solved=solved,
-                    land_mask=land_mask,
-                    snapshot_indices=snap_idx,
-                    output_dir=args.output_dir,
-                    csv_writer=writer,
-                    csv_file=f,
-                    rng=rng,
-                )
+                try:
+                    spatial_maps, count_map, scatter, split_summary = eval_split(
+                        args=args,
+                        split_name=split_name,
+                        model=model,
+                        tap=tap,
+                        dataset=ds,
+                        target_vars=target_vars,
+                        norm_stats=norm_stats,
+                        solved=solved,
+                        land_mask=land_mask,
+                        snapshot_indices=snap_idx,
+                        output_dir=args.output_dir,
+                        csv_writer=writer,
+                        csv_file=f,
+                        rng=rng,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    # If eval_split raises, per_sample_metrics.csv is still
+                    # durable (we flush per row) and partial summary may be
+                    # written. Log loudly and continue to the next split.
+                    print(f"  {split_name}: ERROR during eval — {exc!r}. "
+                          f"Continuing to next split.", flush=True)
+                    continue
                 # eval_split has already persisted spatial_aggregates/ and
                 # scatter_samples_<split>.pt to disk; main only needs the
                 # in-memory copy for the combined scatter file below.
