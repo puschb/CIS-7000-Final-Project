@@ -50,12 +50,7 @@ import sys
 import time
 from pathlib import Path
 
-# Ask UCX (libucs.so) NOT to install its own SIGSEGV/SIGBUS/SIGABRT handlers.
-# Some Nautilus pods load UCX via NCCL/MPI even for single-GPU runs, and its
-# crash handler races with PyTorch / CUDA atexit shutdown — that's the
-# "Caught signal 11" backtrace at the end of a successful run. Setting this
-# before importing torch is enough; we keep our own outputs safe via per-split
-# disk saves and a final os._exit(0) regardless.
+# Asks UCX (libucs.so) NOT to install its own SIGSEGV/SIGBUS/SIGABRT handlers
 os.environ.setdefault("UCX_HANDLE_ERRORS", "none")
 os.environ.setdefault("UCX_ERROR_SIGNALS", "")
 
@@ -78,9 +73,7 @@ from src.linear_probe import (
 )
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Eval pass over a trained linear probe")
@@ -117,11 +110,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-# ---------------------------------------------------------------------------
-# Online aggregators
-# ---------------------------------------------------------------------------
-
+# Online aggregators for spatial maps and scatter plots
 class SpatialAggregator:
     """Per-pixel running sums of |err|, err, err^2, and count over a split."""
 
@@ -218,19 +207,16 @@ class ScatterReservoir:
         }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
+# helper functions
 def make_loader(args: argparse.Namespace, dataset) -> DataLoader:
     kwargs = dict(
         dataset=dataset,
         batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
-        # This is a one-pass evaluation loader, so keep worker lifetime short.
-        # Using persistent workers here has triggered teardown instability on
-        # Nautilus after a split finishes.
+        # using a one pass evaluation loader, so keeping worker lifetimes short
+
+        # avoid persistent_workers due to dataloader teardown on Nautilus pods
         persistent_workers=False,
         worker_init_fn=era5_worker_init_fn,
         collate_fn=collate_era5_batch,
@@ -283,10 +269,7 @@ def prepare_output_dir(path: Path, overwrite: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Per-split eval loop
-# ---------------------------------------------------------------------------
-
+# per-split evaluation loop 
 def eval_split(
     args: argparse.Namespace,
     split_name: str,
@@ -369,7 +352,7 @@ def eval_split(
                 pred_2d  = pred[0]
                 err_2d   = pred_2d - truth_2d
 
-                # Per-sample scalar metrics (land-only).
+                # per-sample scalar metrics (land-only)
                 masked_err = err_2d[mask_hw]
                 n_pix = int(masked_err.numel())
                 if n_pix == 0:
@@ -423,11 +406,6 @@ def eval_split(
                 print(f"  {split_name}: evaluated {n_seen} / {n_total} samples "
                       f"({rate:.2f} samples/s)", flush=True)
 
-        # Loop has finished naturally (StopIteration or --limit). Persist this
-        # split's outputs to disk RIGHT NOW, before the dataloader teardown in
-        # the `finally` block has a chance to segfault during multi-worker
-        # cleanup (UCX/libucs is known to crash here). After this point
-        # everything we computed for this split is durable on disk.
         summary = {f"{split_name}_samples": n_seen}
         for v in target_vars:
             c = max(accum[v]["count"], 1)
@@ -450,7 +428,7 @@ def eval_split(
                 count_map.numpy().astype(np.int32),
             )
         torch.save(scatter_data, output_dir / f"scatter_samples_{split_name}.pt")
-        # Partial summary so a later-split crash doesn't lose the earlier ones.
+        # partial summary so a later-split crash doesn't lose the earlier ones
         partial_path = output_dir / "eval_summary_partial.json"
         partial_payload: dict
         if partial_path.exists():
@@ -467,9 +445,6 @@ def eval_split(
               f"(spatial_aggregates/, scatter_samples_{split_name}.pt, eval_summary_partial.json)",
               flush=True)
     finally:
-        # All outputs for this split are already on disk.  The teardown below
-        # is a known segfault hazard on Nautilus when num_workers > 0.  Wrap
-        # everything broadly so the process can move on to the next split.
         for cleanup_step in ("loader_iter", "loader"):
             try:
                 if cleanup_step in locals():
@@ -482,7 +457,7 @@ def eval_split(
         except BaseException as exc:  # noqa: BLE001
             print(f"  {split_name}: warning — dataset.close() raised {exc!r} "
                   f"(outputs already saved)", flush=True)
-        # Best-effort GPU memory cleanup so the next split gets a fresh slate.
+        # best-effort GPU memory cleanup so the next split gets a fresh slate
         try:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -491,10 +466,6 @@ def eval_split(
 
     return spatial_maps, count_map, scatter_data, summary
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
@@ -541,7 +512,7 @@ def main() -> None:
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # Pull lsm + grid sizing from the first sample of any split.
+    # pull lsm + grid sizing from the first sample of any split
     probe_split = next(s for s in args.splits if len(splits[s]) > 0)
     probe_sample_in, probe_sample_targets = splits[probe_split][0]
     probe_target = probe_sample_targets[0]
@@ -607,33 +578,25 @@ def main() -> None:
                         rng=rng,
                     )
                 except BaseException as exc:  # noqa: BLE001
-                    # If eval_split raises, per_sample_metrics.csv is still
-                    # durable (we flush per row) and partial summary may be
-                    # written. Log loudly and continue to the next split.
                     print(f"  {split_name}: ERROR during eval — {exc!r}. "
                           f"Continuing to next split.", flush=True)
                     continue
-                # eval_split has already persisted spatial_aggregates/ and
-                # scatter_samples_<split>.pt to disk; main only needs the
-                # in-memory copy for the combined scatter file below.
                 scatter_all[split_name] = scatter
                 summary.update(split_summary)
                 print(json.dumps(split_summary, indent=2), flush=True)
         finally:
             tap.close()
 
-    # Save scatter samples (small).
     torch.save(scatter_all, scatter_path)
 
-    # Native units for each target var, so plotting code does not need to
-    # cross-reference physics/ERA5 documentation.
+    # native units for each target var
     var_units = {
         "swvl1": "m^3/m^3",
         "stl1":  "K",
         "sd":    "m",
     }
 
-    # Final summary JSON.
+    # final summary JSON with metadata + per-split metrics (in native units)
     summary_payload = {
         "heads_path": str(args.heads),
         "data_dirs": args.data_dir,
@@ -664,8 +627,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # Skip Python's normal interpreter shutdown: the multi-worker DataLoader
-    # cleanup and CUDA atexit handlers tend to hit UCX (libucs) and segfault
-    # on Nautilus pods even after all useful work is done. Everything we care
-    # about is already on disk by this point, so just exit hard.
     os._exit(0)
