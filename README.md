@@ -9,30 +9,28 @@ docker/Dockerfile              # Docker image: NVIDIA PyTorch + Aurora (deps fro
 k8s/                           # Kubernetes manifests for Nautilus
   aurora-test-cpu-job.yaml     #   Batch: CPU test (small model, no GPU)
   aurora-test-job.yaml         #   Batch: GPU test (small model, A100 80GB)
-  aurora-inference-job.yaml    #   Batch: inference (A100 80GB)
-  aurora-finetune-job.yaml     #   Batch: fine-tuning (A100 80GB)
-  aurora-interactive-cpu-pod.yaml  # Interactive: CPU dev pod
-  aurora-interactive-pod.yaml      # Interactive: GPU dev pod (A100 80GB)
-  aurora-data-pvc.yaml         #   Persistent volume claim (20Gi, rook-ceph-block)
-  aurora-data-shell.yaml       #   Lightweight pod for inspecting the PVC
-  aurora-download-job.yaml     #   Batch: download 10 days of ERA5 data to PVC
+  aurora-inference-job.yaml         #   Batch: inference smoke test
+  aurora-finetune-stage1-job.yaml  #   Batch: Stage 1 fine-tuning on per-step ERA5
+  aurora-interactive-pod.yaml      #   Interactive GPU job with era5-rechunked PVC
+  era5-rechunked-pvc.yaml          #   Main ERA5/results PVC
+  era5-summer-download-job.yaml    #   Batch: download Jun-Jul ERA5 source files
+  split-era5-to-per-timestep-job.yaml  # Convert chunked ERA5 to per-timestep layout
 scripts/                       # Shell & Python scripts
   docker-build-push.sh         #   Build & push Docker image to Docker Hub
   k8s-setup-github-secret.sh   #   One-time: store GitHub credentials on Nautilus
   k8s-test-cpu.sh              #   Run CPU test job
   k8s-test-gpu.sh              #   Run GPU test job
-  k8s-inference.sh             #   Run inference job
-  k8s-finetune.sh              #   Run fine-tuning job
-  k8s-interactive-cpu.sh       #   Start CPU interactive session
+  k8s-inference.sh             #   Run inference smoke job
   k8s-interactive-gpu.sh       #   Start GPU interactive session
   test_aurora_cpu.py           #   Standalone CPU test script
   test_aurora_gpu.py           #   GPU test script (memory usage, model loading)
   download_era5.py             #   Download ERA5 data for a date range (CLI)
   extract_embeddings_tsne.py   #   Extract Aurora embeddings and visualize with t-SNE
 src/                           # Python source code
-  data.py                      #   Batch construction utilities
-  inference.py                 #   Inference CLI
-  finetune.py                  #   Fine-tuning CLI
+  data.py                      #   Batch construction utilities and Stage 1 splits
+  inference.py                 #   Inference smoke-test CLI
+  finetune_stage1.py           #   Stage 1 fine-tuning CLI
+  linear_probe.py              #   Streaming closed-form hydrology linear probe
 notebooks/                     # Jupyter notebooks
   era5_predictions.ipynb       #   ERA5 single-day prediction with AuroraSmallPretrained
   era5_download_crop.ipynb     #   Download, crop, and save ERA5 data (configurable region/date)
@@ -277,7 +275,7 @@ uv run python scripts/test_aurora_cpu.py
 uv run python -m src.inference --small --device cpu
 
 # Run a quick fine-tuning test on CPU (slow but works)
-uv run python -m src.finetune --steps 2
+uv run python -m src.inference --small
 ```
 
 ### Scripts
@@ -296,8 +294,8 @@ These submit a job, stream logs to your terminal, and clean up when done:
 ```bash
 bash scripts/k8s-test-cpu.sh       # CPU test — small model, no GPU
 bash scripts/k8s-test-gpu.sh       # GPU test — small model on A100 80GB
-bash scripts/k8s-inference.sh      # Run inference on A100 80GB
-bash scripts/k8s-finetune.sh       # Run fine-tuning on A100 80GB
+bash scripts/k8s-inference.sh      # Run inference smoke job
+kubectl create -f k8s/aurora-finetune-stage1-job.yaml  # Submit Stage 1 fine-tuning
 ```
 
 To manually manage jobs:
@@ -314,8 +312,7 @@ kubectl delete job <job-name>                      # clean up
 These start a pod with the repo pre-cloned and aurora installed, give you a shell, and clean up when you exit:
 
 ```bash
-bash scripts/k8s-interactive-cpu.sh   # CPU pod (no GPU)
-bash scripts/k8s-interactive-gpu.sh   # GPU pod (A100 80GB)
+bash scripts/k8s-interactive-gpu.sh   # GPU interactive job with era5-rechunked PVC
 ```
 
 Inside the pod, the working directory is `/opt/repo` with the full project:
@@ -323,7 +320,7 @@ Inside the pod, the working directory is `/opt/repo` with the full project:
 ```bash
 python scripts/test_aurora_cpu.py
 python -m src.inference --small
-python -m src.finetune --steps 5
+python -u -m src.finetune_stage1 --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 --run-dir /mnt/data/runs
 ```
 
 To pull the latest code changes inside a running pod:
@@ -335,9 +332,10 @@ cd /opt/repo && git pull
 To manually manage interactive pods:
 
 ```bash
-kubectl create -f k8s/aurora-interactive-cpu-pod.yaml
-kubectl exec -it aurora-dev-cpu -- /bin/bash -c 'cd /opt/repo && bash'
-kubectl delete pod aurora-dev-cpu
+kubectl create -f k8s/aurora-interactive-pod.yaml
+POD=$(kubectl get pods -l job-name=aurora-interactive -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -it "$POD" -- /bin/bash -c 'cd /opt/repo && bash'
+kubectl delete job aurora-interactive
 ```
 
 ### VS Code on Nautilus
@@ -345,7 +343,7 @@ kubectl delete pod aurora-dev-cpu
 You can attach VS Code to a running interactive pod for a full IDE experience:
 
 1. Install the [Kubernetes](https://marketplace.visualstudio.com/items?itemName=ms-kubernetes-tools.vscode-kubernetes-tools) and [Remote Development](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.vscode-remote-extensionpack) VS Code extensions
-2. Start an interactive pod (`bash scripts/k8s-interactive-cpu.sh` in a separate terminal — don't exit)
+2. Start an interactive pod (`bash scripts/k8s-interactive-gpu.sh` in a separate terminal; do not exit until you are done)
 3. In VS Code, open the Kubernetes sidebar (ship wheel icon)
 4. Navigate to: Nautilus > Workloads > Pods > your pod name
 5. Right-click the pod > **Attach Visual Studio Code**

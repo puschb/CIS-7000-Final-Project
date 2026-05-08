@@ -36,19 +36,18 @@ representation, not training an auxiliary model.
    (`src/data.py:131-156`). Set `input_surf_vars=BASE_SURF_VAR_NAMES` (no
    hydrology) and `target_surf_vars=("swvl1","stl1","sd")` and the rest is in
    place.
-5. **`src/baseline.py` already wires up the freezing, hooking, and metrics
-   loop**, but currently hooks the encoder/bottleneck and uses a conv readout +
-   bilinear upsample. The plan below replaces those two choices with the
-   stricter linear-probe form.
+5. **The implemented baseline is `src/linear_probe.py`.** It freezes Aurora,
+   taps the existing surface-head latent, streams the train split once, and
+   solves the linear heads in closed form. The older conv/bilinear pilot was
+   removed to avoid confusing it with the strict linear-probe result.
 6. **Memory budget on 1×A100 80 GB is fine.** Frozen Aurora forward at full
    0.25° resolution is ~40 GB VRAM (per the README); no gradients flow back into
    Aurora, so the only extra memory is the new heads (a few MB).
-7. **Caching is feasible only with a bigger PVC.** The current PVC is 20 GiB
-   (`k8s/aurora-data-pvc.yaml:11`). One sample of cached surface latent is
-   `Hp·Wp·D` floats: small + bf16 = 33 MB; full + bf16 = 66 MB. So 20 GiB holds
-   ~600 small or ~310 full samples — only enough for a tiny pilot. A serious
-   train/val/test cache wants 50–100 GiB. The plan below makes feature caching
-   optional and supports both modes.
+7. **Do not cache all latents for the final run.** We tried the cached-latent
+   design and it was storage-heavy: the full train/val/test cache would exceed
+   100 GB once targets and metadata are included. The final implementation
+   avoids this by streaming latents through the ridge accumulator and writing
+   only compact heads, metrics, spatial aggregates, and scatter samples.
 8. **Aurora's documented extension API exists and would also work.** Microsoft's
    fine-tuning docs describe constructing `AuroraPretrained(surf_vars=("2t",
    "10u","10v","msl","swvl1","stl1","sd"))` plus `load_checkpoint(strict=False)`
@@ -153,122 +152,63 @@ Aurora's representation linearly contains" into "what Aurora's representation
 contains given a different head form", which weakens the comparison to the
 LoRA run.
 
-## Two-stage pipeline: cache then probe
+## Final pipeline: stream latents, solve closed-form ridge
 
-The user's optimisation insight is correct and important. The new heads are
-independent of Aurora at training time; we only need `(latent, target)` pairs.
-So we run Aurora once and reuse the latents for every probe-training epoch.
+The original plan was a two-stage cache: first write every `(latent, target)`
+pair to disk, then train heads from the cache. We abandoned that route because
+it created tens to hundreds of GB of feature files and made the PVC the bottleneck.
 
-### Stage 1: feature extraction (Aurora forward, write latents to disk)
+The implemented baseline is a streaming closed-form linear probe:
 
 ```
-for each (input_batch, target_batch) in ERA5Dataset:
+for each train sample:
     with torch.inference_mode():
-        aurora(input_batch)               # populates the hooked tensor
-    latent = captured_surface_latent      # (1, Hp, Wp, D), bf16
-    targets = stack(swvl1, stl1, sd at t+6h on full grid, fp16)  # (3, H, W)
-    write({"latent": latent, "targets": targets, "t": t},
-          path=f"{out_dir}/{t.isoformat()}.pt")
+        aurora(input_batch)                    # populates the surface-head hook
+    z = captured_surface_latent               # (1, Hp, Wp, D)
+    y = patchified hydrology target at t+6h   # per variable, (Hp*Wp, P*P)
+    apply land mask
+    accumulate XtX += z.T @ z
+    accumulate XtY += z.T @ y
+
+for each variable:
+    W = solve(XtX + lambda * I, XtY)
+    save W, bias, metadata to heads.pt
 ```
 
-Run as a one-off batch job. GPU only needed in this stage. Output is a
-directory of small `.pt` files (one per timestamp), simpler than a single huge
-tensor and easy to shard across train/val/test dates.
+Why this is the right final form:
 
-Disk costs (one sample):
-- latent (bf16): `Hp·Wp·D·2` bytes — 33 MB (small `D=256`), 66 MB (full `D=512`)
-- targets (fp16): `3·H·W·2` bytes — 6.2 MB
-- total per sample: ~40 MB (small) or ~73 MB (full)
+- It gives the exact optimum for the linear head, so the report does not depend
+  on SGD convergence or epoch count.
+- It uses one pass over the train split and does not materialize the latent
+  cache on disk.
+- It keeps the experiment strict: Aurora is frozen, hydrology is absent from
+  the input surface variables, and the only learned mapping is `Linear(D, P*P)`.
+- It writes compact outputs: `heads.pt`, aggregate metrics, optional
+  per-sample metrics, spatial aggregates, and scatter samples.
 
-For a 1 000 train + 200 val + 200 test budget:
-- small model: ~56 GB → need a ~75 GiB PVC
-- full model: ~102 GB → need a ~150 GiB PVC
+Current commands:
 
-Action item: bump `aurora-data-pvc.yaml` to `100Gi` (small) or `150Gi` (full)
-*for this experiment*, in a new dedicated PVC named `hydrology-features` so the
-existing `aurora-data` PVC is untouched. If quota is the issue, fall back to a
-shorter time range or run the no-cache mode below.
+```bash
+python -u -m src.linear_probe \
+  --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 \
+  --small \
+  --device cuda \
+  --output-dir /mnt/data/runs/linear_probe_streaming
 
-### Stage 1.5: no-cache fallback
+python -u -m scripts.eval_linear_probe \
+  --heads /mnt/data/runs/linear_probe_streaming/heads.pt \
+  --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 \
+  --output-dir /mnt/data/runs/linear_probe_streaming_eval \
+  --splits val test \
+  --small \
+  --device cuda
 
-If the bigger PVC isn't available, we can also run Stage 1 + Stage 2 inline in
-a single GPU job: stream samples through Aurora and immediately update the
-linear heads with the freshly produced latent. This is what `src/baseline.py`
-currently does, modulo replacing its head with the linear probe. Slower per
-epoch, no extra storage. Recommended for the initial pilot run.
-
-### Stage 2: linear-probe training (CPU- or GPU-light, no Aurora)
-
+python -u -m scripts.compute_reference_baselines \
+  --data-dir /mnt/data/era5/per-step/2024 /mnt/data/era5/per-step/2025 \
+  --output-base /mnt/data/runs/reference_baselines \
+  --baselines persistence climatology \
+  --splits val test
 ```
-heads = nn.ModuleDict({
-    name: nn.Linear(D, P*P) for name in ("swvl1", "stl1", "sd")
-})
-opt = AdamW(heads.parameters(), lr=3e-4, weight_decay=1e-4)
-
-for epoch in range(num_epochs):
-    for sample in cached_features:
-        z = sample["latent"]                     # (1, Hp, Wp, D)
-        y_true = sample["targets"]               # (3, H, W)
-        y_pred = []
-        for name in ("swvl1","stl1","sd"):
-            y_var = heads[name](z)               # (1, Hp, Wp, P*P)
-            y_var = pixel_shuffle(y_var, P)      # (1, 1, H, W)
-            y_pred.append(y_var.squeeze(1))
-        y_pred = torch.cat(y_pred, dim=0)        # (3, H, W)
-        y_pred_n = (y_pred - mu) / sigma         # per-variable normalisation
-        y_true_n = (y_true - mu) / sigma
-        loss = (mask * (y_pred_n - y_true_n).abs()).sum() / mask.sum()
-        loss.backward(); opt.step(); opt.zero_grad()
-```
-
-This is the entire probe-training loop. It runs in seconds per epoch on a
-laptop CPU and converges in tens of epochs. A notebook is fine; a small CLI
-script is better for reproducibility.
-
-### Closed-form solve (recommended for the headline number)
-
-The head is a single linear layer, the same `Linear(D, P·P)` applied at every
-spatial position. With `M = N · Hp · Wp` rows of `D`-dim latent features and
-matching `P·P`-dim target patches, the ridge-regression solution
-`W = (XᵀX + λI)⁻¹ XᵀY` of shape `(D, P·P)` is the *provably optimal* linear
-probe. Both `XᵀX` (256×256 ≈ 0.5 MB) and `XᵀY` (256×16 ≈ 4 KB per variable)
-are streaming-accumulable: walk the dataset once, accumulate the two
-matrices, solve once.
-
-Why this is worth doing instead of (or alongside) SGD:
-
-- It removes any "did the optimizer converge?" question from the report.
-  The number is the optimum, full stop.
-- It's faster than SGD for this problem size (one pass over the data + one
-  256×256 solve, vs. tens of epochs).
-- It separates the *measurement* (a closed-form ridge regression) from the
-  *training framework*, which makes the apples-to-apples comparison with the
-  LoRA run rest only on the dataset, normalisation, and mask — not on the
-  optimiser.
-
-Implementation sketch:
-
-```python
-# Per variable v in {swvl1, stl1, sd}:
-XtX = torch.zeros(D, D)
-XtY = torch.zeros(D, P*P)
-n   = 0
-
-for sample in cached_features:
-    z = sample["latent"].reshape(-1, D)              # (Hp*Wp, D)
-    y = sample["targets"][v]                         # (H, W) → (Hp*Wp, P*P)
-    y = patchify(y, P)                               # invert pixel_shuffle
-    m = sample["land_mask"].reshape(-1)              # (Hp*Wp,)
-    z = z[m]; y = y[m]
-    XtX += z.T @ z
-    XtY += z.T @ y
-    n   += z.shape[0]
-
-W = torch.linalg.solve(XtX + lam * torch.eye(D), XtY)   # (D, P*P)
-```
-
-Use SGD only as a sanity check that closed-form gives the same loss. They
-must match to numerical precision; if they don't, there is a bug.
 
 ## Loss / metrics / fairness checklist
 
@@ -296,81 +236,31 @@ must match to numerical precision; if they don't, there is a bug.
 
 | Artefact | Where |
 |---|---|
-| Tap-point spike notebook | `notebooks/probe_tap_point.ipynb` (new) |
-| Stage 1 script (latent extraction) | `scripts/extract_surface_latents.py` (new) |
-| Stage 2 script (closed-form ridge solve + metrics) | `src/linear_probe.py` (new) |
-| Reference-baselines script (persistence, climatology) | `scripts/reference_baselines.py` (new) |
-| Configs (date splits, normalisation stats, ridge λ, mask) | `configs/baseline.yaml` (new) |
-| All four rows of the comparison | `results/linear_probe/metrics.json` |
-| Trained head weights | `results/linear_probe/heads.pt` |
-| Larger PVC (if caching) | `k8s/hydrology-features-pvc.yaml` (new, 100 Gi) |
-| Stage-1 batch job | `k8s/extract-latents-job.yaml` (new) |
-| Stage-2 batch job (or run locally) | `k8s/linear-probe-job.yaml` (new, CPU is fine) |
+| Streaming linear-probe fit | `src/linear_probe.py` |
+| Linear-probe evaluation pass | `scripts/eval_linear_probe.py` |
+| Reference baselines | `scripts/compute_reference_baselines.py` |
+| Linear-probe aggregate metrics | `results/linear_probe/streaming_fit/metrics.json` and `results/linear_probe/eval_20260506/eval_summary.json` |
+| Per-sample, spatial, and scatter outputs | `results/linear_probe/eval_20260506/` |
+| Reference-baseline outputs | `results/reference_baselines/{persistence,climatology}/` |
+| Analysis notebook and figures | `notebooks/linear_probe_analysis.ipynb`, `results/linear_probe/figures/` |
 
-## Step-by-step build order (translates directly to code)
+## Implemented build order
 
-1. **Tap-point spike (≤ 1 hour, AuroraSmall on CPU or a small interactive
-   pod).** In a notebook:
-   - `model = AuroraSmallPretrained(); model.load_checkpoint(); model.eval()`
-   - `print(model.decoder)` — find the surface head module for `2t`. Note
-     whether it's keyed under `surf_heads`, `surf_head`, etc.; whether it's
-     `nn.ModuleDict` of `Linear` or `nn.ParameterDict` of weight tensors;
-     whether `bias=True/False`; whether there is a `LayerNorm` immediately
-     before it.
-   - Register a forward pre-hook on that module to capture its input. Run one
-     forward pass.
-   - Run the captured tensor back through the same module and pixel-shuffle
-     it; assert the result matches `pred.surf_vars["2t"]` to fp32 precision.
-   - Now you know exactly the (i) tap-point module path, (ii) latent shape,
-     and (iii) head structure to mirror. **Do not write `src/linear_probe.py`
-     until this notebook check passes.**
-2. **Build the linear-probe head as a thin standalone module.** A single
-   class `SurfacePatchHead(nn.Linear(D, P*P))` plus a `patches_to_image`
-   helper that mirrors whatever pixel-shuffle / reshape Aurora's existing
-   head does. Construct one per target variable.
-3. **Inline pilot on AuroraSmall, no cache.** Edit `src/baseline.py`:
-   - Drop `SurfaceReadoutHead`; use the new `SurfacePatchHead`.
-   - Replace `_tokens_to_grid` with the surface-slab slicing that matches
-     Tap A (or, if Tap A's path is awkward, Tap B with the equivalence
-     check).
-   - Add per-variable normalisation, land mask, per-variable metrics.
-   - Add the three asserts (no hydrology in input, Aurora frozen, head
-     parameter count under 1 M).
-   - Run `python -m src.baseline --small --train-limit 8 --val-limit 4
-     --epochs 1` end-to-end on real ERA5 in an interactive GPU pod.
-   - Sanity check: loss decreases; held-out MAE for at least one of the three
-     variables beats persistence.
-4. **Build the cache pipeline once the pilot is green.**
-   - `scripts/extract_surface_latents.py`: same hook logic as the pilot,
-     writes `{"latent": (Hp,Wp,D) bf16, "targets": dict, "land_mask": ...,
-     "t": ...}` per timestamp. One `.pt` file per sample.
-   - `k8s/hydrology-features-pvc.yaml` (new, 100 GiB) and
-     `k8s/extract-latents-job.yaml` (new). Submit one batch job per split.
-5. **Stage-2 closed-form solver.** `src/linear_probe.py`:
-   - `CachedFeatureDataset` yields `(latent, targets, land_mask)` from disk.
-   - Per variable, accumulate `XᵀX` and `XᵀY` over the training split (with
-     land mask), solve `(XᵀX + λI)⁻¹ XᵀY`, save `W` and `b` to
-     `results/linear_probe/heads.pt`.
-   - Sweep ridge `λ` on the val split, pick the winner, evaluate on the
-     test split.
-   - As a sanity check, also run the SGD loop from Stage 2 in the doc above
-     and assert its final test loss equals the closed-form loss to within a
-     small tolerance. They should match because the problem is convex and
-     the closed-form is the optimum.
-6. **Reference baselines on the same test split.** A small script that, for
-   each test timestamp, computes (a) persistence prediction `x(t)` and
-   (b) climatology prediction (precomputed long-term mean per `(lat, lon,
-   hour-of-year)` from training data). Same masked, per-variable RMSE/MAE
-   path; same JSON output schema. Numbers go into the same
-   `results/linear_probe/metrics.json` so all four rows of the comparison
-   table live in one file.
-7. **Headline run on AuroraFull.** Same scripts, larger `D=512`. Re-extract
-   latents (Stage 1), re-solve closed-form (Stage 2). Single A100 80GB job
-   for Stage 1; CPU job for Stage 2.
-8. **Report**: a four-row table — persistence, climatology, linear probe on
-   AuroraSmall latent, linear probe on AuroraFull latent — with per-variable
-   MAE and RMSE in native units on the test split. This is the deliverable
-   the LoRA run will be compared against.
+1. **Find and verify the surface-head tap point.** We hook the input to the
+   existing `2t` surface head, which is the same surface latent consumed by
+   Aurora's pretrained surface heads.
+2. **Fit the streaming probe.** `src.linear_probe` runs frozen Aurora over the
+   Stage 1 train split, accumulates `X^T X` and `X^T Y`, solves the ridge system,
+   and evaluates val/test aggregate metrics.
+3. **Run the expanded evaluation pass.** `scripts.eval_linear_probe` writes
+   per-sample metrics, spatial aggregate maps, and reservoir-subsampled scatter
+   tensors for report figures.
+4. **Run reference baselines.** `scripts.compute_reference_baselines` computes
+   persistence and hour-of-day climatology using surface files only, avoiding
+   unnecessary atmospheric IO.
+5. **Analyze locally.** `notebooks.linear_probe_analysis.ipynb` produces the
+   headline metric charts, spatial maps, temporal plots, STL1 hour-of-day
+   baseline check, and predicted-vs-truth scatter plots.
 
 ## Confirming this matches your specification
 
@@ -384,10 +274,9 @@ must match to numerical precision; if they don't, there is a bug.
   excluded from input and asserted absent.
 - ✅ Targets at `t+6h` cover all 7 surface vars in the dataset, but the loss is
   computed only over `{swvl1, stl1, sd}`, as you specified.
-- ✅ Two-stage pipeline supported: cache once, probe-train cheaply afterwards.
-  Inline single-stage mode also supported as a fallback.
-- ✅ Feasibility on Nautilus: A100 80 GB is enough for the frozen forward;
-  PVC needs to be enlarged only if we want to cache features at scale.
+- ✅ Streaming closed-form pipeline avoids the abandoned latent-cache storage blow-up.
+- ✅ Feasibility on Nautilus: the A100/L40-class GPU is enough for the frozen forward;
+  the PVC only stores compact results rather than full latent tensors.
 
 ## What still has to be confirmed at the keyboard (and what doesn't)
 
@@ -404,9 +293,8 @@ Verified against the codebase and the Aurora paper while writing this plan:
 - `ERA5Dataset` in `src/data.py` accepts `input_surf_vars` and
   `target_surf_vars` independently and already exposes `static_vars["lsm"]`
   for masking; no dataset changes are required for the linear probe.
-- `src/baseline.py` already implements the freeze-Aurora + hook + readout
-  pattern; the plan reuses its structure and replaces the head + the
-  feature-extraction shape.
+- `src/linear_probe.py` implements the freeze-Aurora + surface-head hook +
+  closed-form ridge solve used for the final reported baseline.
 
 Cannot be confirmed in this sandbox (no aurora package installed, no
 external network); to be checked in Step 1 of the build order:
@@ -427,4 +315,4 @@ external network); to be checked in Step 1 of the build order:
 - [Aurora module index (microsoft.github.io)](https://microsoft.github.io/aurora/_modules/aurora/model/aurora.html)
 - [microsoft/aurora repo (github.com)](https://github.com/microsoft/aurora)
 - Aurora paper, Supplementary B.1–B.3 (`aurora.pdf` in this repo, pages ~14–16)
-- This repo: `src/baseline.py`, `src/data.py`, `docs/aurora_regional_embeddings.md`, `k8s/aurora-data-pvc.yaml`
+- This repo: `src/linear_probe.py`, `src/data.py`, `docs/aurora_regional_embeddings.md`, `k8s/era5-rechunked-pvc.yaml`
