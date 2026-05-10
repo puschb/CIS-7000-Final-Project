@@ -84,11 +84,11 @@ spec:
           mountPath: /dev/shm
         resources:
           requests:
-            memory: 64Gi
+            memory: 96Gi
             cpu: "8"
             nvidia.com/gpu: "1"
           limits:
-            memory: 64Gi
+            memory: 96Gi
             cpu: "8"
             nvidia.com/gpu: "1"
       volumes:
